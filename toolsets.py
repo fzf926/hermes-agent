@@ -31,6 +31,8 @@ from typing import List, Dict, Any, Set, Optional
 _HERMES_CORE_TOOLS = [
     # Web
     "web_search", "web_extract",
+    # Database operations
+    "dbops_query",
     # Terminal + process management
     "terminal", "process",
     # File manipulation
@@ -86,6 +88,12 @@ TOOLSETS = {
     "search": {
         "description": "Web search only (no content extraction/scraping)",
         "tools": ["web_search"],
+        "includes": []
+    },
+
+    "dbops": {
+        "description": "DBOps SQL query tool via HTTP",
+        "tools": ["dbops_query"],
         "includes": []
     },
     

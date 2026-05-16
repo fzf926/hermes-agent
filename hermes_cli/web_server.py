@@ -460,6 +460,10 @@ class EnvVarReveal(BaseModel):
     key: str
 
 
+class DBOpsCookieUpdate(BaseModel):
+    cookie: str
+
+
 class ModelAssignment(BaseModel):
     """Payload for POST /api/model/set — assign a provider/model to a slot.
 
@@ -1267,6 +1271,23 @@ async def reveal_env_var(body: EnvVarReveal, request: Request):
 
     _log.info("env/reveal: %s", body.key)
     return {"key": body.key, "value": value}
+
+
+@app.post("/api/dbops/cookie")
+async def set_dbops_cookie(body: DBOpsCookieUpdate):
+    """Parse a raw cookie string and persist filtered DBOps cookies."""
+    try:
+        from tools.dbops_tool import save_dbops_cookie_from_raw
+
+        result = save_dbops_cookie_from_raw(body.cookie)
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error", "invalid cookie"))
+        return result
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/dbops/cookie failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ---------------------------------------------------------------------------
