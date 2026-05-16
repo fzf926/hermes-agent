@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import gzip
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -88,20 +89,18 @@ def parse_dbops_cookie_input(raw_cookie: str) -> dict[str, str]:
 
 
 def save_dbops_cookie_from_raw(raw_cookie: str) -> dict[str, Any]:
-    filtered = parse_dbops_cookie_input(raw_cookie)
-    missing = [key for key in COOKIE_KEYS if not filtered.get(key)]
-    if missing:
+    cookie_text = str(raw_cookie or "").strip()
+    if not cookie_text:
         return {
             "ok": False,
-            "error": "Missing required cookie fields: " + ", ".join(missing),
+            "error": "cookie cannot be empty",
             "saved_path": str(get_dbops_cookie_path()),
         }
-
     path = get_dbops_cookie_path()
     _ensure_parent_dir(path)
-    content = {"cookies": {key: filtered.get(key, "") for key in COOKIE_KEYS}}
+    content = {"cookie": cookie_text}
     path.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"ok": True, "saved_path": str(path), "cookie_keys": list(COOKIE_KEYS)}
+    return {"ok": True, "saved_path": str(path)}
 
 
 def _ensure_default_cookie_file() -> None:
@@ -109,7 +108,7 @@ def _ensure_default_cookie_file() -> None:
     if path.exists():
         return
     _ensure_parent_dir(path)
-    empty = {"cookies": {key: "" for key in COOKIE_KEYS}}
+    empty = {"cookie": ""}
     path.write_text(json.dumps(empty, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -121,11 +120,25 @@ def _ensure_default_db_config_file() -> None:
     path.write_text("[]\n", encoding="utf-8")
 
 
-def _load_dbops_cookies() -> dict[str, str]:
+def _extract_csrf_token(cookie_text: str) -> str:
+    parsed = _extract_cookie_map(cookie_text)
+    return parsed.get("csrftoken", "")
+
+
+def _load_dbops_cookie_text() -> str:
     _ensure_default_cookie_file()
     data = _load_json_file(get_dbops_cookie_path()) or {}
-    cookie_source = data.get("cookies", data) if isinstance(data, dict) else {}
-    return _extract_cookie_map(cookie_source)
+    if isinstance(data, dict):
+        # New format: raw cookie string as-is
+        if isinstance(data.get("cookie"), str):
+            return data.get("cookie", "").strip()
+        # Backward compatibility: old split-cookie format
+        if "cookies" in data:
+            cookie_map = _extract_cookie_map(data.get("cookies"))
+            return "; ".join(f"{k}={v}" for k, v in cookie_map.items() if v)
+    if isinstance(data, str):
+        return data.strip()
+    return ""
 
 
 def _load_dbops_db_configs() -> list[dict[str, Any]]:
@@ -252,6 +265,22 @@ def _format_records(columns: list[Any], rows: list[Any]) -> list[dict[str, Any]]
     ]
 
 
+def _decode_http_body(raw_bytes: bytes, content_encoding: str) -> str:
+    """Decode HTTP body with transparent gzip support."""
+    body = raw_bytes or b""
+    encoding = (content_encoding or "").lower()
+    try:
+        if "gzip" in encoding:
+            body = gzip.decompress(body)
+        elif body.startswith(b"\x1f\x8b"):
+            # Some upstreams forget Content-Encoding, but payload is still gzipped.
+            body = gzip.decompress(body)
+    except Exception:
+        # Fall back to raw bytes decode so caller can inspect response_preview.
+        pass
+    return body.decode("utf-8", errors="replace")
+
+
 def _build_dbops_schema_overrides() -> dict[str, Any]:
     configs = _load_dbops_db_configs()
     home = display_hermes_home()
@@ -321,12 +350,9 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
     if isinstance(resolved, str):
         return tool_error(resolved)
 
-    cookie_map = _load_dbops_cookies()
-    missing = [key for key in COOKIE_KEYS if not cookie_map.get(key)]
-    if missing:
-        return tool_error(
-            "Missing required cookies in ~/.hermes/config/dbops_cookie.json: " + ", ".join(missing)
-        )
+    cookie_text = _load_dbops_cookie_text()
+    if not cookie_text:
+        return tool_error("dbops cookie is empty in ~/.hermes/config/dbops_cookie.json")
 
     payload = {
         "instance_name": resolved.instance_name,
@@ -343,14 +369,18 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
         "X-Requested-With": "XMLHttpRequest",
         "Origin": "https://dbops.codemao.cn",
         "Referer": "https://dbops.codemao.cn/sqlquery/",
-        "Cookie": "; ".join(f"{k}={v}" for k, v in cookie_map.items()),
-        "X-CSRFToken": cookie_map.get("csrftoken", ""),
+        "Cookie": cookie_text,
+        "X-CSRFToken": _extract_csrf_token(cookie_text),
     }
 
     request = Request(DBOPS_QUERY_URL, data=body, headers=headers, method="POST")
     try:
         with urlopen(request, timeout=30) as response:
-            raw_text = response.read().decode("utf-8", errors="replace")
+            raw_bytes = response.read()
+            raw_text = _decode_http_body(
+                raw_bytes=raw_bytes,
+                content_encoding=response.headers.get("Content-Encoding", ""),
+            )
     except HTTPError as exc:
         return tool_error(f"DBOps HTTP error: {exc.code} {exc.reason}")
     except URLError as exc:

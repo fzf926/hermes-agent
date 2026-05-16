@@ -349,6 +349,8 @@ TOOLSETS = {
         "tools": [
             # Web
             "web_search", "web_extract",
+            # DBOps SQL query
+            "dbops_query",
             # Terminal + process management
             "terminal", "process",
             # File manipulation
