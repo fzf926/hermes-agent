@@ -56,6 +56,7 @@ from gateway.fulfillment_judge import conversation_for_api, judge_fulfillment
 from gateway.sql_execution import (
     capture_dbops_sql_execution,
     sql_records_for_api,
+    sql_results_display_for_api,
 )
 
 logger = logging.getLogger(__name__)
@@ -920,6 +921,19 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> None:
         payload["conversation"] = conversation_for_api(fulfillment)
 
+    def _attach_sql_results(
+        self,
+        payload: Dict[str, Any],
+        sql_records: List[Dict[str, Any]],
+    ) -> None:
+        """Attach per-query SQL metadata and merged markdown table display."""
+        if not sql_records:
+            return
+        payload["sql"] = sql_records_for_api(sql_records)
+        combined = sql_results_display_for_api(sql_records)
+        if combined:
+            payload["sql_display"] = combined
+
     def _check_mysql_chat_available(self) -> Optional["web.Response"]:
         """Return error response if MySQL chat store is not configured."""
         from gateway.chat_mysql_store import is_mysql_store_enabled
@@ -1648,8 +1662,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if err_msg:
                 response_headers["X-Hermes-Error"] = err_msg[:200]
 
-        if sql_records:
-            response_data["sql"] = sql_records_for_api(sql_records)
+        self._attach_sql_results(response_data, sql_records)
 
         effective_session_id = result.get("session_id", session_id)
         turn_status = "answered"
@@ -1844,8 +1857,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
-            if sql_records:
-                finish_chunk["sql"] = sql_records_for_api(sql_records)
+            self._attach_sql_results(finish_chunk, sql_records)
             if fulfillment:
                 self._attach_conversation(finish_chunk, fulfillment)
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
@@ -2424,8 +2436,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
-                if sql_records:
-                    completed_env["sql"] = sql_records_for_api(sql_records)
+                self._attach_sql_results(completed_env, sql_records)
                 if stream_fulfillment:
                     self._attach_conversation(completed_env, stream_fulfillment)
                 full_history = self._build_response_conversation_history(
@@ -2801,8 +2812,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
-        if sql_records:
-            response_data["sql"] = sql_records_for_api(sql_records)
+        self._attach_sql_results(response_data, sql_records)
 
         resp_turn_status = "answered"
         if result.get("error"):

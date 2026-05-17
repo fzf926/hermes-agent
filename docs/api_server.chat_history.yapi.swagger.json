@@ -238,7 +238,15 @@
         "executed_at": {"type": "string", "format": "date-time"},
         "error_message": {"type": "string"},
         "query_time_ms": {"type": "number"},
-        "row_count": {"type": "integer"}
+        "row_count": {"type": "integer"},
+        "result_table": {
+          "type": "string",
+          "description": "Markdown table: column headers + all rows merged"
+        },
+        "user_display": {
+          "type": "string",
+          "description": "User-facing markdown block (metadata + result_table) for one SQL execution"
+        }
       }
     },
     "ChatUserSessionsResponse": {

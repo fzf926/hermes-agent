@@ -11,6 +11,9 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+_DBOPS_META_MARKER = "\n__DBOPS_META__\n"
+
+
 def _parse_tool_json(function_result: Any) -> Optional[Dict[str, Any]]:
     if function_result is None:
         return None
@@ -21,6 +24,19 @@ def _parse_tool_json(function_result: Any) -> Optional[Dict[str, Any]]:
     text = function_result.strip()
     if not text:
         return None
+
+    if _DBOPS_META_MARKER in function_result:
+        display_part, _, meta_part = function_result.partition(_DBOPS_META_MARKER)
+        try:
+            meta = json.loads(meta_part.strip())
+        except json.JSONDecodeError:
+            meta = {}
+        if isinstance(meta, dict):
+            if display_part.strip() and not meta.get("user_display"):
+                meta["user_display"] = display_part.strip()
+            return meta
+        return None
+
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
@@ -86,6 +102,16 @@ def capture_dbops_sql_execution(
             except (TypeError, ValueError):
                 row_count = None
 
+    user_display: Optional[str] = None
+    result_table: Optional[str] = None
+    if parsed:
+        ud = parsed.get("user_display")
+        if isinstance(ud, str) and ud.strip():
+            user_display = ud.strip()
+        rt = parsed.get("result_table")
+        if isinstance(rt, str) and rt.strip():
+            result_table = rt.strip()
+
     if not sql_content:
         return None
     if not database and not instance:
@@ -107,6 +133,10 @@ def capture_dbops_sql_execution(
         record["query_time_ms"] = query_time_ms
     if row_count is not None:
         record["row_count"] = row_count
+    if user_display:
+        record["user_display"] = user_display
+    if result_table:
+        record["result_table"] = result_table
     return record
 
 
@@ -130,8 +160,24 @@ def sql_records_for_api(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             item["query_time_ms"] = rec["query_time_ms"]
         if rec.get("row_count") is not None:
             item["row_count"] = rec["row_count"]
+        if rec.get("user_display"):
+            item["user_display"] = rec["user_display"]
+        if rec.get("result_table"):
+            item["result_table"] = rec["result_table"]
         out.append(item)
     return out
+
+
+def sql_results_display_for_api(records: List[Dict[str, Any]]) -> str:
+    """Merge multiple SQL execution ``user_display`` blocks for API consumers."""
+    from tools.dbops_result_formatter import format_multiple_dbops_displays
+
+    sections = [
+        str(rec.get("user_display") or "").strip()
+        for rec in records
+        if rec.get("user_display")
+    ]
+    return format_multiple_dbops_displays(sections)
 
 
 def sql_records_for_turn_api(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

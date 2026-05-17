@@ -14,9 +14,25 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from hermes_constants import display_hermes_home, get_hermes_home
+from tools.dbops_result_formatter import (
+    align_rows_to_columns,
+    format_dbops_user_display,
+    format_markdown_table,
+)
+
+DBOPS_META_MARKER = "\n__DBOPS_META__\n"
 from tools.registry import registry, tool_error, tool_result
+from tools.sql_audit import SqlAuditor
 
 logger = logging.getLogger(__name__)
+
+_sql_auditor = SqlAuditor()
+
+_DBOPS_AGENT_INSTRUCTION = (
+    "向用户展示查询结果时：必须完整复制 user_display 中的「查询成功」摘要和同一张 Markdown 表格；"
+    "禁止把多行结果拆成「记录 1 / 记录 2」逐字段列举。"
+    "同轮多次 dbops_query 时，按每次调用的 user_display 分块展示，不要混在一张表里。"
+)
 
 DBOPS_QUERY_URL = "https://dbops.codemao.cn/query/"
 COOKIE_KEYS = (
@@ -300,14 +316,23 @@ def _build_dbops_schema_overrides() -> dict[str, Any]:
         "description": (
             "Run SQL query by calling DBOps HTTP endpoint. Cookies are loaded from "
             f"{home}/config/dbops_cookie.json. Database candidates are loaded from "
-            f"{config_path}; the model should choose the most suitable db_key."
+            f"{config_path}; the model should choose the most suitable db_key. "
+            "On success, copy ``user_display`` verbatim to the user (one summary line + one table with "
+            "all rows). Never list rows as 记录1/记录2 field-by-field. See ``agent_instruction``."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "sql_content": {
                     "type": "string",
-                    "description": "SQL to execute in DBOps, e.g. select * from tbl_term where id = 17660",
+                    "description": (
+                        "SQL to execute in DBOps (read-only). Only SELECT and EXPLAIN are allowed; "
+                        "e.g. select * from tbl_term where id = 17660"
+                    ),
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "可选，业务用户 ID，供后续 SQL 权限审核使用。",
                 },
                 "db_key": db_key_prop,
                 "instance_name": {
@@ -349,6 +374,29 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
     resolved = DBOpsResolvedQuery.resolve(query_input)
     if isinstance(resolved, str):
         return tool_error(resolved)
+
+    user_id = str(args.get("user_id", "")).strip() or None
+    audit = _sql_auditor.audit(
+        resolved.sql_content,
+        user_id=user_id,
+        context={
+            "db_key": resolved.db_key,
+            "instance_name": resolved.instance_name,
+            "db_name": resolved.db_name,
+        },
+    )
+    if not audit.passed:
+        return tool_error(
+            f"SQL audit failed: {audit.message}",
+            success=False,
+            sql_audit=audit.to_dict(),
+            source={
+                "db_key": resolved.db_key,
+                "instance_name": resolved.instance_name,
+                "db_name": resolved.db_name,
+            },
+            query={"full_sql": resolved.sql_content},
+        )
 
     cookie_text = _load_dbops_cookie_text()
     if not cookie_text:
@@ -439,24 +487,42 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
         )
 
     columns = data.get("column_list") if isinstance(data.get("column_list"), list) else []
-    rows = data.get("rows") if isinstance(data.get("rows"), list) else []
-    records = _format_records(columns, rows)
-    return tool_result(
-        success=True,
-        status=status,
-        msg=msg,
-        query={
+    raw_rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+    rows = align_rows_to_columns(columns, raw_rows)
+    row_count = len(rows)
+    query_time = data.get("query_time")
+    try:
+        query_time_f = float(query_time) if query_time is not None else None
+    except (TypeError, ValueError):
+        query_time_f = None
+
+    result_table = format_markdown_table(columns, rows)
+    user_display = format_dbops_user_display(
+        sql_content=resolved.sql_content,
+        instance_name=resolved.instance_name,
+        db_name=resolved.db_name,
+        columns=columns,
+        rows=rows,
+        row_count=row_count,
+        query_time=query_time_f,
+    )
+    # 工具返回值以 Markdown 表格为主，避免模型只读 JSON 时自行挑选少量字段展示。
+    meta = {
+        "success": True,
+        "status": status,
+        "msg": msg,
+        "row_count": row_count,
+        "column_count": len(columns),
+        "agent_instruction": _DBOPS_AGENT_INSTRUCTION,
+        "query": {
             "full_sql": data.get("full_sql"),
-            "query_time": data.get("query_time"),
+            "query_time": query_time,
             "affected_rows": data.get("affected_rows"),
             "seconds_behind_master": data.get("seconds_behind_master"),
         },
-        columns=columns,
-        row_count=len(rows),
-        records=records,
-        warning=data.get("warning"),
-        error=data.get("error"),
-        source={
+        "warning": data.get("warning"),
+        "error": data.get("error"),
+        "source": {
             "db_key": resolved.db_key,
             "instance_name": resolved.instance_name,
             "db_name": resolved.db_name,
@@ -464,18 +530,22 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
             "tb_name": resolved.tb_name,
             "limit_num": resolved.limit_num,
         },
-    )
+    }
+    return user_display + DBOPS_META_MARKER + json.dumps(meta, ensure_ascii=False)
 
 
 DBOPS_QUERY_SCHEMA = {
     "name": "dbops_query",
-    "description": "Run SQL query by calling DBOps HTTP endpoint.",
+    "description": (
+        "通过 DBOps 执行只读 SQL。成功后必须把 user_display（一行摘要 + 整张表）原样给用户，"
+        "禁止按「记录1/记录2」逐条写字段。"
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "sql_content": {
                 "type": "string",
-                "description": "SQL to execute in DBOps.",
+                "description": "SQL to execute in DBOps (SELECT or EXPLAIN only).",
             }
         },
         "required": ["sql_content"],
