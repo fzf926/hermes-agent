@@ -482,6 +482,25 @@ if _config_path.exists():
                         os.environ[_env_var] = json.dumps(_val)
                     else:
                         os.environ[_env_var] = str(_val)
+        # MySQL chat persistence (API server → chat_session/chat_message/chat_turn).
+        _mysql_chat_cfg = _cfg.get("mysql_chat", {})
+        if _mysql_chat_cfg and isinstance(_mysql_chat_cfg, dict):
+            _mysql_env_map = {
+                "enabled": "HERMES_MYSQL_ENABLED",
+                "host": "HERMES_MYSQL_HOST",
+                "port": "HERMES_MYSQL_PORT",
+                "user": "HERMES_MYSQL_USER",
+                "password": "HERMES_MYSQL_PASSWORD",
+                "database": "HERMES_MYSQL_DATABASE",
+            }
+            for _cfg_key, _env_var in _mysql_env_map.items():
+                if _cfg_key in _mysql_chat_cfg:
+                    _val = _mysql_chat_cfg[_cfg_key]
+                    if isinstance(_val, bool):
+                        os.environ[_env_var] = "1" if _val else "0"
+                    else:
+                        os.environ[_env_var] = str(_val)
+
         # Compression config is read directly from config.yaml by run_agent.py
         # and auxiliary_client.py — no env var bridging needed.
         # Auxiliary model/direct-endpoint overrides (vision, web_extract).

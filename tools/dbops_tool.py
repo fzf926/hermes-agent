@@ -373,6 +373,16 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
         "X-CSRFToken": _extract_csrf_token(cookie_text),
     }
 
+    _source = {
+        "db_key": resolved.db_key,
+        "instance_name": resolved.instance_name,
+        "db_name": resolved.db_name,
+        "schema_name": resolved.schema_name,
+        "tb_name": resolved.tb_name,
+        "limit_num": resolved.limit_num,
+    }
+    _query_meta = {"full_sql": resolved.sql_content}
+
     request = Request(DBOPS_QUERY_URL, data=body, headers=headers, method="POST")
     try:
         with urlopen(request, timeout=30) as response:
@@ -382,16 +392,37 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
                 content_encoding=response.headers.get("Content-Encoding", ""),
             )
     except HTTPError as exc:
-        return tool_error(f"DBOps HTTP error: {exc.code} {exc.reason}")
+        return tool_error(
+            f"DBOps HTTP error: {exc.code} {exc.reason}",
+            success=False,
+            source=_source,
+            query=_query_meta,
+        )
     except URLError as exc:
-        return tool_error(f"DBOps request failed: {exc.reason}")
+        return tool_error(
+            f"DBOps request failed: {exc.reason}",
+            success=False,
+            source=_source,
+            query=_query_meta,
+        )
     except Exception as exc:
-        return tool_error(f"DBOps request failed: {exc}")
+        return tool_error(
+            f"DBOps request failed: {exc}",
+            success=False,
+            source=_source,
+            query=_query_meta,
+        )
 
     try:
         parsed = json.loads(raw_text)
     except Exception:
-        return tool_error("DBOps returned non-JSON response", response_preview=raw_text[:500])
+        return tool_error(
+            "DBOps returned non-JSON response",
+            success=False,
+            response_preview=raw_text[:500],
+            source=_source,
+            query=_query_meta,
+        )
 
     status = parsed.get("status")
     msg = parsed.get("msg")
@@ -399,9 +430,12 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
     if status != 0:
         return tool_error(
             f"DBOps query failed: {msg or 'unknown error'}",
+            success=False,
             status=status,
             data_error=data.get("error"),
             warning=data.get("warning"),
+            source=_source,
+            query=_query_meta,
         )
 
     columns = data.get("column_list") if isinstance(data.get("column_list"), list) else []

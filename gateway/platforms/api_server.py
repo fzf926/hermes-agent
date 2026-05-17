@@ -13,6 +13,8 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- GET  /api/chat/users/{user_id}/sessions — list MySQL-stored sessions for a user
+- GET  /api/chat/sessions/{session_id}/turns — list Q&A turns for a session (by id, session_uid, or hermes_session_id)
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -50,8 +52,26 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.sql_execution import (
+    capture_dbops_sql_execution,
+    sql_records_for_api,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _append_dbops_sql_record(
+    sql_records: List[Dict[str, Any]],
+    tool_call_id: Optional[str],
+    function_name: str,
+    function_args: Any,
+    function_result: Any,
+) -> None:
+    rec = capture_dbops_sql_execution(
+        tool_call_id, function_name, function_args, function_result
+    )
+    if rec:
+        sql_records.append(rec)
 
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
@@ -635,6 +655,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Lazy-init MySQL chat persistence (False = disabled/unavailable)
+        self._chat_mysql_store: Any = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -726,6 +748,257 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    # ------------------------------------------------------------------
+    # MySQL chat persistence
+    # ------------------------------------------------------------------
+
+    def _get_chat_mysql_store(self):
+        """Return ChatMySQLStore instance, or None if disabled/unavailable."""
+        if self._chat_mysql_store is False:
+            return None
+        if self._chat_mysql_store is None:
+            try:
+                from gateway.chat_mysql_store import ChatMySQLStore, is_mysql_store_enabled
+
+                if is_mysql_store_enabled():
+                    self._chat_mysql_store = ChatMySQLStore.from_env()
+                    logger.info(
+                        "MySQL chat persistence enabled (database=%s)",
+                        self._chat_mysql_store._config.database,
+                    )
+                else:
+                    self._chat_mysql_store = False
+            except Exception as exc:
+                logger.warning(
+                    "MySQL chat persistence disabled: %s "
+                    "(install: pip install 'pymysql>=1.1,<2'; "
+                    "configure HERMES_MYSQL_* or mysql_chat in config.yaml)",
+                    exc,
+                )
+                self._chat_mysql_store = False
+        return self._chat_mysql_store if self._chat_mysql_store is not False else None
+
+    @staticmethod
+    def _parse_user_id(request: "web.Request", body: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Resolve business user id from body or headers."""
+        body = body or {}
+        for key in ("user_id", "userId"):
+            val = body.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()[:64]
+
+        metadata = body.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("user_id", "userId"):
+                val = metadata.get(key)
+                if val is not None and str(val).strip():
+                    return str(val).strip()[:64]
+
+        for header in ("X-Hermes-User-Id", "X-User-Id"):
+            raw = request.headers.get(header, "").strip()
+            if not raw:
+                continue
+            if re.search(r"[\r\n\x00]", raw):
+                return None
+            return raw[:64]
+        return None
+
+    @staticmethod
+    def _content_to_storage_text(content: Any) -> str:
+        """Flatten message content for MySQL storage."""
+        if isinstance(content, str):
+            return content
+        return _normalize_chat_content(content)
+
+    async def _persist_chat_to_mysql(
+        self,
+        *,
+        user_id: str,
+        hermes_session_id: str,
+        question_text: str,
+        answer_text: Optional[str],
+        model: Optional[str],
+        usage: Optional[Dict[str, Any]],
+        channel: str = "api_server",
+        completion_id: Optional[str] = None,
+        response_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        status: str = "answered",
+        error_message: Optional[str] = None,
+        sql_executions: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        store = self._get_chat_mysql_store()
+        if not store:
+            return
+        if not user_id:
+            logger.info(
+                "MySQL chat persist skipped: missing user_id "
+                "(set X-Hermes-User-Id header or body.user_id)"
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+
+        def _run():
+            meta = store.save_qa_turn(
+                user_id=user_id,
+                hermes_session_id=hermes_session_id,
+                question_text=question_text,
+                answer_text=answer_text,
+                model=model,
+                usage=usage,
+                channel=channel,
+                completion_id=completion_id,
+                response_id=response_id,
+                run_id=run_id,
+                status=status,
+                error_message=error_message,
+            )
+            if sql_executions and meta:
+                store.save_sql_executions(
+                    session_id=meta["session_id"],
+                    turn_id=meta["turn_id"],
+                    user_id=user_id,
+                    executions=sql_executions,
+                )
+
+        try:
+            await loop.run_in_executor(None, _run)
+            logger.info(
+                "MySQL chat persisted user_id=%s session=%s status=%s sql_count=%s",
+                user_id,
+                hermes_session_id,
+                status,
+                len(sql_executions or []),
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist chat to MySQL: %s", exc, exc_info=True)
+
+    def _check_mysql_chat_available(self) -> Optional["web.Response"]:
+        """Return error response if MySQL chat store is not configured."""
+        from gateway.chat_mysql_store import is_mysql_store_enabled
+
+        if not is_mysql_store_enabled():
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "MySQL chat persistence is not enabled",
+                        "type": "service_unavailable",
+                    }
+                },
+                status=503,
+            )
+        if self._get_chat_mysql_store() is None:
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "MySQL chat store unavailable (check pymysql and credentials)",
+                        "type": "service_unavailable",
+                    }
+                },
+                status=503,
+            )
+        return None
+
+    @staticmethod
+    def _sanitize_path_id(value: str, *, name: str = "id") -> tuple[Optional[str], Optional["web.Response"]]:
+        raw = (value or "").strip()
+        if not raw:
+            return None, web.json_response(
+                _openai_error(f"Missing {name}", err_type="invalid_request_error"),
+                status=400,
+            )
+        if re.search(r"[\r\n\x00]", raw):
+            return None, web.json_response(
+                _openai_error(f"Invalid {name}", err_type="invalid_request_error"),
+                status=400,
+            )
+        return raw[:128], None
+
+    @staticmethod
+    def _parse_pagination(request: "web.Request", *, default_limit: int = 20) -> tuple[int, int]:
+        """Parse limit and page (1-based) query parameters."""
+        try:
+            limit = int(request.query.get("limit", default_limit))
+        except (TypeError, ValueError):
+            limit = default_limit
+        try:
+            page = int(request.query.get("page", 1))
+        except (TypeError, ValueError):
+            page = 1
+        limit = max(1, min(limit, 100))
+        page = max(1, page)
+        return limit, page
+
+    async def _run_mysql_chat_query(self, fn):
+        """Run a blocking MySQL read in a thread pool."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, fn)
+
+    async def _handle_list_user_chat_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/chat/users/{user_id}/sessions — list sessions for a user."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        mysql_err = self._check_mysql_chat_available()
+        if mysql_err:
+            return mysql_err
+
+        user_id, id_err = self._sanitize_path_id(request.match_info.get("user_id", ""), name="user_id")
+        if id_err:
+            return id_err
+
+        limit, page = self._parse_pagination(request)
+        store = self._get_chat_mysql_store()
+
+        try:
+            result = await self._run_mysql_chat_query(
+                lambda: store.list_sessions_by_user_id(user_id, limit=limit, page=page)
+            )
+            return web.json_response(result)
+        except Exception as exc:
+            logger.warning("Failed to list chat sessions for user %s: %s", user_id, exc, exc_info=True)
+            return web.json_response(
+                _openai_error(f"Failed to list sessions: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_list_session_chat_turns(self, request: "web.Request") -> "web.Response":
+        """GET /api/chat/sessions/{session_id}/turns — list Q&A turns for a session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        mysql_err = self._check_mysql_chat_available()
+        if mysql_err:
+            return mysql_err
+
+        session_ref, id_err = self._sanitize_path_id(
+            request.match_info.get("session_id", ""), name="session_id"
+        )
+        if id_err:
+            return id_err
+
+        store = self._get_chat_mysql_store()
+
+        try:
+            result = await self._run_mysql_chat_query(
+                lambda: store.list_turns_by_session_ref(session_ref)
+            )
+            if result.get("session") is None:
+                return web.json_response(
+                    _openai_error(f"Session not found: {session_ref}"),
+                    status=404,
+                )
+            return web.json_response(result)
+        except Exception as exc:
+            logger.warning(
+                "Failed to list chat turns for session %s: %s", session_ref, exc, exc_info=True
+            )
+            return web.json_response(
+                _openai_error(f"Failed to list turns: {exc}", err_type="server_error"),
+                status=500,
+            )
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -970,6 +1243,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "approval_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
+                "mysql_chat_history": True,
                 "cors": bool(self._cors_origins),
             },
             "endpoints": {
@@ -978,6 +1252,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "chat_user_sessions": {
+                    "method": "GET",
+                    "path": "/api/chat/users/{user_id}/sessions",
+                },
+                "chat_session_turns": {
+                    "method": "GET",
+                    "path": "/api/chat/sessions/{session_id}/turns",
+                },
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -1006,6 +1288,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = body.get("stream", False)
+        user_id = self._parse_user_id(request, body)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -1103,6 +1386,7 @@ class APIServerAdapter(BasePlatformAdapter):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        sql_records: List[Dict[str, Any]] = []
 
         if stream:
             import queue as _q
@@ -1158,6 +1442,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 id, or never seen) so clients never get an orphaned
                 ``completed`` they can't correlate to a prior ``running``.
                 """
+                _append_dbops_sql_record(
+                    sql_records, tool_call_id, function_name, function_args, function_result
+                )
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
@@ -1195,6 +1482,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                mysql_user_id=user_id,
+                mysql_question_text=self._content_to_storage_text(user_message),
+                sql_records=sql_records,
+            )
+
+        def _on_tool_complete_nonstream(
+            tool_call_id, function_name, function_args, function_result
+        ):
+            _append_dbops_sql_record(
+                sql_records, tool_call_id, function_name, function_args, function_result
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1205,6 +1502,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_complete_callback=_on_tool_complete_nonstream,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1305,12 +1603,38 @@ class APIServerAdapter(BasePlatformAdapter):
             if err_msg:
                 response_headers["X-Hermes-Error"] = err_msg[:200]
 
+        if sql_records:
+            response_data["sql"] = sql_records_for_api(sql_records)
+
+        effective_session_id = result.get("session_id", session_id)
+        if user_id:
+            turn_status = "answered"
+            if is_failed or (not completed and err_msg):
+                turn_status = "error"
+            elif is_partial:
+                turn_status = "interrupted"
+            await self._persist_chat_to_mysql(
+                user_id=user_id,
+                hermes_session_id=effective_session_id,
+                question_text=self._content_to_storage_text(user_message),
+                answer_text=final_response or None,
+                model=model_name,
+                usage=usage,
+                completion_id=completion_id,
+                status=turn_status,
+                error_message=err_msg,
+                sql_executions=sql_records or None,
+            )
+
         return web.json_response(response_data, headers=response_headers)
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        mysql_user_id: Optional[str] = None,
+        mysql_question_text: Optional[str] = None,
+        sql_records: Optional[List[Dict[str, Any]]] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1319,6 +1643,8 @@ class APIServerAdapter(BasePlatformAdapter):
         LLM API calls, and the asyncio task wrapper is cancelled.
         """
         import queue as _q
+
+        sql_records = sql_records if sql_records is not None else []
 
         sse_headers = {
             "Content-Type": "text/event-stream",
@@ -1404,11 +1730,42 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            agent_result: Optional[Dict[str, Any]] = None
             try:
                 result, agent_usage = await agent_task
+                agent_result = result if isinstance(result, dict) else None
                 usage = agent_usage or usage
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+
+            if mysql_user_id and mysql_question_text:
+                final_text = ""
+                turn_status = "answered"
+                err_msg = None
+                if agent_result:
+                    final_text = agent_result.get("final_response") or ""
+                    if agent_result.get("failed"):
+                        turn_status = "error"
+                        err_msg = agent_result.get("error")
+                    elif agent_result.get("partial"):
+                        turn_status = "interrupted"
+                        err_msg = agent_result.get("error")
+                effective_sid = (
+                    (agent_result or {}).get("session_id") or session_id or ""
+                )
+                if effective_sid:
+                    await self._persist_chat_to_mysql(
+                        user_id=mysql_user_id,
+                        hermes_session_id=effective_sid,
+                        question_text=mysql_question_text,
+                        answer_text=final_text or None,
+                        model=model,
+                        usage=usage,
+                        completion_id=completion_id,
+                        status=turn_status,
+                        error_message=err_msg,
+                        sql_executions=sql_records or None,
+                    )
 
             # Finish chunk
             finish_chunk = {
@@ -1421,6 +1778,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
+            if sql_records:
+                finish_chunk["sql"] = sql_records_for_api(sql_records)
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -1475,6 +1834,9 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        mysql_user_id: Optional[str] = None,
+        mysql_question_text: Optional[str] = None,
+        sql_records: Optional[List[Dict[str, Any]]] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -1505,6 +1867,8 @@ class APIServerAdapter(BasePlatformAdapter):
         recover from.
         """
         import queue as _q
+
+        sql_records = sql_records if sql_records is not None else []
 
         sse_headers = {
             "Content-Type": "text/event-stream",
@@ -1565,6 +1929,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         final_response_text = ""
         agent_error: Optional[str] = None
+        result: Optional[Dict[str, Any]] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
 
@@ -1979,6 +2344,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                if sql_records:
+                    completed_env["sql"] = sql_records_for_api(sql_records)
                 full_history = self._build_response_conversation_history(
                     conversation_history,
                     user_message,
@@ -1994,6 +2361,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     "type": "response.completed",
                     "response": completed_env,
                 })
+
+            if mysql_user_id and mysql_question_text:
+                effective_session_id = session_id
+                if isinstance(result, dict) and result.get("session_id"):
+                    effective_session_id = result["session_id"]
+                await self._persist_chat_to_mysql(
+                    user_id=mysql_user_id,
+                    hermes_session_id=effective_session_id,
+                    question_text=mysql_question_text,
+                    answer_text=final_response_text or None,
+                    model=model,
+                    usage=usage,
+                    response_id=response_id,
+                    status="error" if agent_error else "answered",
+                    error_message=agent_error,
+                    sql_executions=sql_records or None,
+                )
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             _persist_incomplete_if_needed()
@@ -2083,6 +2467,7 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = body.get("store", True)
+        user_id = self._parse_user_id(request, body)
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -2164,6 +2549,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
+        sql_records: List[Dict[str, Any]] = []
 
         stream = bool(body.get("stream", False))
         if stream:
@@ -2199,6 +2585,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Queue a completed tool result for live function_call_output streaming."""
+                _append_dbops_sql_record(
+                    sql_records, tool_call_id, function_name, function_args, function_result
+                )
                 _stream_q.put(("__tool_completed__", {
                     "tool_call_id": tool_call_id,
                     "name": function_name,
@@ -2242,6 +2631,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                mysql_user_id=user_id,
+                mysql_question_text=self._content_to_storage_text(user_message),
+                sql_records=sql_records,
+            )
+
+        def _on_tool_complete_responses(
+            tool_call_id, function_name, function_args, function_result
+        ):
+            _append_dbops_sql_record(
+                sql_records, tool_call_id, function_name, function_args, function_result
             )
 
         async def _compute_response():
@@ -2251,6 +2650,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_complete_callback=_on_tool_complete_responses,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2316,6 +2716,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        if sql_records:
+            response_data["sql"] = sql_records_for_api(sql_records)
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -2333,6 +2735,22 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = {"X-Hermes-Session-Id": session_id}
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
+
+        if user_id:
+            effective_session_id = result.get("session_id", session_id)
+            await self._persist_chat_to_mysql(
+                user_id=user_id,
+                hermes_session_id=effective_session_id,
+                question_text=self._content_to_storage_text(user_message),
+                answer_text=final_response or None,
+                model=body.get("model", self._model_name),
+                usage=usage,
+                response_id=response_id,
+                status="answered",
+                error_message=result.get("error"),
+                sql_executions=sql_records or None,
+            )
+
         return web.json_response(response_data, headers=response_headers)
 
     # ------------------------------------------------------------------
@@ -3378,6 +3796,15 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            # MySQL-backed chat history queries
+            self._app.router.add_get(
+                "/api/chat/users/{user_id}/sessions",
+                self._handle_list_user_chat_sessions,
+            )
+            self._app.router.add_get(
+                "/api/chat/sessions/{session_id}/turns",
+                self._handle_list_session_chat_turns,
+            )
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)

@@ -1,0 +1,1046 @@
+{
+  "info": {
+    "_postman_id": "1d8a15dc-d6bb-47ab-a779-83a3e930f8ee",
+    "name": "Hermes Agent API Server",
+    "description": "来源: gateway/platforms/api_server.py。\n\n本 Collection 覆盖该文件对外暴露的全部 HTTP API，并在请求描述中包含入参/出参说明。\n\n认证:\n- 受保护接口需携带 `Authorization: Bearer {{apiKey}}`\n- 当服务端未配置 API key 时，认证可被跳过（仅建议本地环境）\n\nSSE 重点:\n- `POST /v1/chat/completions` 当 `stream=true` 时返回 SSE\n- `POST /v1/responses` 当 `stream=true` 时返回 SSE\n- `GET /v1/runs/{run_id}/events` 固定返回 SSE\n\n建议先设置变量 `baseUrl` 与 `apiKey` 再执行。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8642"
+    },
+    {
+      "key": "apiKey",
+      "value": "replace-with-api-server-key"
+    },
+    {
+      "key": "responseId",
+      "value": "resp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "key": "runId",
+      "value": "run_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "key": "jobId",
+      "value": "0123456789ab"
+    },
+    {
+      "key": "sessionId",
+      "value": "demo-session-id"
+    },
+    {
+      "key": "userId",
+      "value": "10001"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health & Discovery",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "用途: 简单健康检查。\n\n入参:\n- 无\n\n出参(200):\n- status: string\n- platform: string"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"status\": \"ok\",\n  \"platform\": \"hermes-agent\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /health/detailed",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/detailed",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "detailed"
+              ]
+            },
+            "description": "用途: 详细运行状态（dashboard 探活）。\n\n入参:\n- 无\n\n出参(200):\n- status, platform\n- gateway_state\n- platforms (object)\n- active_agents (number)\n- exit_reason\n- updated_at\n- pid"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"status\": \"ok\",\n  \"platform\": \"hermes-agent\",\n  \"gateway_state\": \"running\",\n  \"platforms\": {},\n  \"active_agents\": 0,\n  \"exit_reason\": null,\n  \"updated_at\": \"2026-05-16T16:55:00Z\",\n  \"pid\": 12345\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /v1/health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "health"
+              ]
+            },
+            "description": "用途: `/health` 的 v1 别名。\n\n入参: 无\n\n出参(200): 同 `/health`。"
+          }
+        },
+        {
+          "name": "GET /v1/models",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/models",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
+            },
+            "description": "用途: 返回可用模型列表（OpenAI 兼容）。\n\n入参:\n- Header: Authorization (可选取决于服务端配置)\n\n出参(200):\n- object: list\n- data: model[] (id/object/created/owned_by/root/parent 等)"
+          }
+        },
+        {
+          "name": "GET /v1/capabilities",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/capabilities",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "capabilities"
+              ]
+            },
+            "description": "用途: 返回 API 能力声明（含 features/endpoints）。\n\n入参:\n- Header: Authorization\n\n出参(200):\n- object/platform/model\n- auth\n- runtime\n- features（包含 `chat_completions_streaming`、`responses_streaming`、`run_events_sse`）\n- endpoints"
+          }
+        }
+      ]
+    },
+    {
+      "name": "OpenAI Chat & Responses",
+      "item": [
+        {
+          "name": "POST /v1/chat/completions (non-stream)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Hermes-Session-Id",
+                "value": "{{sessionId}}",
+                "disabled": true
+              },
+              {
+                "key": "X-Hermes-Session-Key",
+                "value": "tenant:user:channel",
+                "disabled": true
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "chat-demo-key-001",
+                "disabled": true
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"hermes-agent\",\n  \"stream\": false,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are Hermes.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"请总结一下今天的待办\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "用途: OpenAI Chat Completions 兼容接口。\n\n主要入参:\n- model: string\n- messages: array (required)\n- stream: boolean (默认 false)\n- 可选 Header: X-Hermes-Session-Id / X-Hermes-Session-Key / Idempotency-Key\n\n主要出参(200, JSON):\n- id/object/created/model\n- choices[].message.role/content\n- choices[].finish_reason\n- usage.input_tokens/output_tokens/total_tokens\n- Header: X-Hermes-Session-Id (总会返回), X-Hermes-Session-Key (如果有)"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"id\": \"chatcmpl-abc123\",\n  \"object\": \"chat.completion\",\n  \"created\": 1778920000,\n  \"model\": \"hermes-agent\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"这是你的待办总结...\"\n      },\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 123,\n    \"output_tokens\": 45,\n    \"total_tokens\": 168\n  }\n}"
+            },
+            {
+              "name": "400 Bad Request",
+              "status": "Bad Request",
+              "code": 400,
+              "body": "{\n  \"error\": {\n    \"message\": \"Missing or invalid 'messages' field\",\n    \"type\": \"invalid_request_error\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /v1/chat/completions (stream=true, SSE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"hermes-agent\",\n  \"stream\": true,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"逐步解释一下 HTTP keepalive\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "description": "用途: Chat Completions 流式输出。\n\n入参关键点:\n- stream 必须为 true\n\n出参:\n- Content-Type: text/event-stream\n- SSE `data:` 事件包含增量文本与工具生命周期事件\n- 末尾会发送 `[DONE]`\n\nPostman 使用建议:\n- 直接发送可看到原始 SSE 流；如需持续观察，建议在 Postman Console 查看。"
+          },
+          "response": [
+            {
+              "name": "200 SSE",
+              "status": "OK",
+              "code": 200,
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "text/event-stream"
+                }
+              ],
+              "body": "data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"HTTP \"}}]}\n\ndata: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"keepalive\"}}]}\n\ndata: [DONE]\n"
+            }
+          ]
+        },
+        {
+          "name": "POST /v1/responses (non-stream)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Hermes-Session-Key",
+                "value": "tenant:user:channel",
+                "disabled": true
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "resp-demo-key-001",
+                "disabled": true
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"hermes-agent\",\n  \"input\": \"帮我写一个简单的发布公告\",\n  \"instructions\": \"语气正式、简洁\",\n  \"stream\": false,\n  \"store\": true,\n  \"conversation\": \"release-announcement-demo\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            },
+            "description": "用途: OpenAI Responses API 兼容接口。\n\n主要入参:\n- input: string | message[] (required)\n- instructions: string (optional)\n- previous_response_id / conversation / conversation_history (可选)\n- store: boolean (默认 true)\n- stream: boolean (默认 false)\n\n主要出参(200, JSON):\n- id/object/status/created_at/model\n- output[]\n- usage.input_tokens/output_tokens/total_tokens\n- Header: X-Hermes-Session-Id, X-Hermes-Session-Key(如有)"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"id\": \"resp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"created_at\": 1778920000,\n  \"model\": \"hermes-agent\",\n  \"output\": [\n    {\n      \"id\": \"msg_1\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"以下是发布公告...\"\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 120,\n    \"output_tokens\": 60,\n    \"total_tokens\": 180\n  }\n}"
+            },
+            {
+              "name": "404 Previous response not found",
+              "status": "Not Found",
+              "code": 404,
+              "body": "{\n  \"error\": {\n    \"message\": \"Previous response not found: resp_not_exists\",\n    \"type\": \"invalid_request_error\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /v1/responses (stream=true, SSE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"hermes-agent\",\n  \"input\": \"帮我写一份会议纪要模板\",\n  \"stream\": true,\n  \"store\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            },
+            "description": "用途: Responses API 流式输出。\n\n入参关键点:\n- stream=true\n\n出参:\n- Content-Type: text/event-stream\n- SSE 事件包含 `response.created`、`response.output_text.delta`、`response.completed` 等（取决于执行过程）"
+          },
+          "response": [
+            {
+              "name": "200 SSE",
+              "status": "OK",
+              "code": 200,
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "text/event-stream"
+                }
+              ],
+              "body": "event: response.created\ndata: {\"id\":\"resp_xxx\",\"status\":\"in_progress\"}\n\nevent: response.output_text.delta\ndata: {\"delta\":\"会议纪要模板\"}\n\nevent: response.completed\ndata: {\"id\":\"resp_xxx\",\"status\":\"completed\"}\n\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Response Resource",
+      "item": [
+        {
+          "name": "GET /v1/responses/{response_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses/{{responseId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses",
+                "{{responseId}}"
+              ]
+            },
+            "description": "用途: 获取已存储 response。\n\n入参:\n- Path: response_id\n\n出参:\n- 200: response 对象\n- 404: response 不存在"
+          }
+        },
+        {
+          "name": "DELETE /v1/responses/{response_id}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses/{{responseId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses",
+                "{{responseId}}"
+              ]
+            },
+            "description": "用途: 删除已存储 response。\n\n入参:\n- Path: response_id\n\n出参:\n- 200: {id, object, deleted: true}\n- 404: response 不存在"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Runs API",
+      "item": [
+        {
+          "name": "POST /v1/runs",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Hermes-Session-Key",
+                "value": "tenant:user:channel",
+                "disabled": true
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"hermes-agent\",\n  \"input\": \"帮我规划下周项目推进\",\n  \"instructions\": \"输出分点计划\",\n  \"conversation_history\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"我们是一个 3 人团队\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/runs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "runs"
+              ]
+            },
+            "description": "用途: 异步启动一次 run，立即返回 run_id。\n\n主要入参:\n- input: string | message[] (required)\n- instructions: string (optional)\n- previous_response_id / conversation_history / session_id (optional)\n\n出参:\n- 202: {run_id, status: \"started\"}\n- 429: 并发超限"
+          },
+          "response": [
+            {
+              "name": "202 Accepted",
+              "status": "Accepted",
+              "code": 202,
+              "body": "{\n  \"run_id\": \"run_4e1a58a2c8f84b8fa8f7d7d4e7bbf9c1\",\n  \"status\": \"started\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /v1/runs/{run_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/runs/{{runId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "runs",
+                "{{runId}}"
+              ]
+            },
+            "description": "用途: 查询 run 状态（轮询）。\n\n入参:\n- Path: run_id\n\n出参:\n- 200: status 对象（queued/running/waiting_for_approval/completed/failed/cancelled 等）\n- 404: run 不存在"
+          }
+        },
+        {
+          "name": "GET /v1/runs/{run_id}/events (SSE)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/runs/{{runId}}/events",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "runs",
+                "{{runId}}",
+                "events"
+              ]
+            },
+            "description": "用途: 订阅 run 生命周期事件（SSE）。\n\n入参:\n- Path: run_id\n\n出参:\n- Content-Type: text/event-stream\n- data: {event, run_id, timestamp, ...}\n- 心跳: `: keepalive`\n- 结束: `: stream closed`"
+          }
+        },
+        {
+          "name": "POST /v1/runs/{run_id}/approval",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"choice\": \"once\",\n  \"all\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/runs/{{runId}}/approval",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "runs",
+                "{{runId}}",
+                "approval"
+              ]
+            },
+            "description": "用途: 响应 run 的审批请求。\n\n入参:\n- choice: once | session | always | deny（也支持 approve/approved/allow 别名）\n- all 或 resolve_all: boolean (可选)\n\n出参:\n- 200: {object, run_id, choice, resolved}\n- 409: 没有活动审批会话或无待审批项"
+          }
+        },
+        {
+          "name": "POST /v1/runs/{run_id}/stop",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/runs/{{runId}}/stop",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "runs",
+                "{{runId}}",
+                "stop"
+              ]
+            },
+            "description": "用途: 中断正在执行的 run。\n\n入参:\n- Path: run_id\n\n出参:\n- 200: {run_id, status: \"stopping\"}\n- 404: run 不存在"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Cron Jobs API",
+      "item": [
+        {
+          "name": "GET /api/jobs",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/jobs?include_disabled=false",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "jobs"
+              ],
+              "query": [
+                {
+                  "key": "include_disabled",
+                  "value": "false"
+                }
+              ]
+            },
+            "description": "用途: 列出 Cron 任务。\n\n入参:\n- Query: include_disabled=true|false (可选)\n\n出参:\n- 200: {jobs: []}"
+          }
+        },
+        {
+          "name": "POST /api/jobs",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"daily-summary\",\n  \"schedule\": \"0 9 * * *\",\n  \"prompt\": \"总结昨日告警并给出建议\",\n  \"deliver\": \"local\",\n  \"skills\": [\n    \"ops\"\n  ],\n  \"repeat\": 1\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/jobs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "jobs"
+              ]
+            },
+            "description": "用途: 创建 Cron 任务。\n\n入参:\n- name: string (required, <=200)\n- schedule: string (required)\n- prompt: string (<=5000)\n- deliver: string (default local)\n- skills: array/string (optional)\n- repeat: positive integer (optional)\n\n出参:\n- 200: {job: {...}}\n- 400: 参数校验错误"
+          }
+        },
+        {
+          "name": "GET /api/jobs/{job_id}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/jobs/{{jobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "jobs",
+                "{{jobId}}"
+              ]
+            },
+            "description": "用途: 查询单个 Cron 任务。\n\n入参:\n- job_id 必须匹配 `[a-f0-9]{12}`\n\n出参:\n- 200: {job: {...}}\n- 404: Job not found"
+          }
+        },
+        {
+          "name": "PATCH /api/jobs/{job_id}",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"daily-summary-updated\",\n  \"schedule\": \"every 2h\",\n  \"prompt\": \"更新后的任务提示\",\n  \"enabled\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/jobs/{{jobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "jobs",
+                "{{jobId}}"
+              ]
+            },
+            "description": "用途: 更新 Cron 任务。\n\n允许更新字段:\n- name, schedule, prompt, deliver, skills, skill, repeat, enabled\n\n出参:\n- 200: {job: {...}}\n- 400: 无有效字段或字段超限"
+          }
+        },
+        {
+          "name": "DELETE /api/jobs/{job_id}",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/jobs/{{jobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "jobs",
+                "{{jobId}}"
+              ]
+            },
+            "description": "用途: 删除 Cron 任务。\n\n出参:\n- 200: {ok: true}\n- 404: Job not found"
+          }
+        },
+        {
+          "name": "POST /api/jobs/{job_id}/pause",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/jobs/{{jobId}}/pause",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "jobs",
+                "{{jobId}}",
+                "pause"
+              ]
+            },
+            "description": "用途: 暂停任务。\n\n出参:\n- 200: {job: {...}}\n- 404: Job not found"
+          }
+        },
+        {
+          "name": "POST /api/jobs/{job_id}/resume",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/jobs/{{jobId}}/resume",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "jobs",
+                "{{jobId}}",
+                "resume"
+              ]
+            },
+            "description": "用途: 恢复任务。\n\n出参:\n- 200: {job: {...}}\n- 404: Job not found"
+          }
+        },
+        {
+          "name": "POST /api/jobs/{job_id}/run",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/jobs/{{jobId}}/run",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "jobs",
+                "{{jobId}}",
+                "run"
+              ]
+            },
+            "description": "用途: 立即触发任务执行。\n\n出参:\n- 200: {job: {...}}\n- 404: Job not found"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Chat History API (MySQL)",
+      "description": "MySQL 落库后的会话与对话轮次查询。需启用 mysql_chat / HERMES_MYSQL_*。",
+      "item": [
+        {
+          "name": "GET /api/chat/users/{user_id}/sessions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/chat/users/{{userId}}/sessions?limit=20&page=1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "chat",
+                "users",
+                "{{userId}}",
+                "sessions"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "description": "每页条数，默认 20，最大 100"
+                },
+                {
+                  "key": "page",
+                  "value": "1",
+                  "description": "页码，从 1 开始，默认 1"
+                }
+              ]
+            },
+            "description": "用途: 按业务用户 ID 查询会话列表（按 updated_at 倒序）。\n\n入参:\n- Path: user_id (string)\n- Query: limit (可选, 1-100, 默认 20)\n- Query: page (可选, 从 1 开始, 默认 1)\n\n出参(200):\n- object: \"list\"\n- user_id: string\n- total: number\n- limit: number\n- page: number\n- sessions: array\n  - id, session_uid, hermes_session_id, user_id, channel, status\n  - turn_count, last_question\n  - started_at, updated_at, created_at\n\n出参(503): MySQL 未启用或不可用"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"object\": \"list\",\n  \"user_id\": \"10001\",\n  \"total\": 1,\n  \"limit\": 20,\n  \"page\": 1,\n  \"sessions\": [\n    {\n      \"id\": 1,\n      \"session_uid\": \"a1b2c3d4e5f6...\",\n      \"hermes_session_id\": \"sess_abc123\",\n      \"user_id\": \"10001\",\n      \"channel\": \"api_server\",\n      \"status\": 1,\n      \"turn_count\": 3,\n      \"last_question\": \"最近一条用户问题\",\n      \"started_at\": \"2026-05-17T10:00:00\",\n      \"updated_at\": \"2026-05-17T10:30:00\"\n    }\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /api/chat/sessions/{session_id}/turns",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/chat/sessions/{{sessionId}}/turns",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "chat",
+                "sessions",
+                "{{sessionId}}",
+                "turns"
+              ]
+            },
+            "description": "用途: 按会话 ID 查询问答轮次列表（按 turn_no 升序，第 1 轮在上）。\n\n入参:\n- Path: session_id — 支持以下任一形式:\n  - 数据库自增 id (如 1)\n  - session_uid\n  - hermes_session_id (X-Hermes-Session-Id)\n\n出参(200):\n- object: \"list\"\n- session: object (会话元数据)\n- total: number\n- turns: array (按 turn_no ASC)\n  - turn_no, question_text, answer_text\n  - status: answered|timeout|error|interrupted\n  - error_message, created_at\n\n出参(404): 会话不存在\n出参(503): MySQL 未启用或不可用"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"object\": \"list\",\n  \"session\": {\n    \"id\": 1,\n    \"session_uid\": \"a1b2c3d4e5f6...\",\n    \"hermes_session_id\": \"sess_abc123\",\n    \"user_id\": \"10001\",\n    \"channel\": \"api_server\"\n  },\n  \"total\": 2,\n  \"turns\": [\n    {\n      \"turn_no\": 1,\n      \"question_text\": \"你好\",\n      \"answer_text\": \"你好，我是 Hermes\",\n      \"status\": \"answered\",\n      \"created_at\": \"2026-05-17T10:00:01\"\n    },\n    {\n      \"turn_no\": 2,\n      \"question_text\": \"第二条问题\",\n      \"answer_text\": \"第二条回答\",\n      \"status\": \"answered\",\n      \"created_at\": \"2026-05-17T10:05:01\"\n    }\n  ]\n}"
+            },
+            {
+              "name": "404 Not Found",
+              "status": "Not Found",
+              "code": 404,
+              "body": "{\n  \"error\": {\n    \"message\": \"Session not found: demo-session-id\",\n    \"type\": \"invalid_request_error\"\n  }\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "SSE / stream=true 专区",
+      "description": "这里单独收拢所有 SSE 相关接口，方便前端或集成方快速验证流式行为。",
+      "item": [
+        {
+          "name": "SSE - Chat Completions (stream=true)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"hermes-agent\",\n  \"stream\": true,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"流式返回测试\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "SSE - Responses (stream=true)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"hermes-agent\",\n  \"input\": \"流式 responses 测试\",\n  \"stream\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            }
+          }
+        },
+        {
+          "name": "SSE - Run Events",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{apiKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/runs/{{runId}}/events",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "runs",
+                "{{runId}}",
+                "events"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,258 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Hermes Chat History API",
+    "description": "MySQL 聊天记录查询接口（独立 Swagger，仅含 2 个 GET 接口）。来源: gateway/platforms/api_server.py + gateway/chat_mysql_store.py",
+    "version": "1.0.0"
+  },
+  "host": "127.0.0.1:8642",
+  "basePath": "/",
+  "schemes": ["http"],
+  "consumes": ["application/json"],
+  "produces": ["application/json"],
+  "securityDefinitions": {
+    "BearerAuth": {
+      "type": "apiKey",
+      "name": "Authorization",
+      "in": "header",
+      "description": "Format: Bearer <API_SERVER_KEY>"
+    }
+  },
+  "tags": [
+    {
+      "name": "chat_history",
+      "description": "MySQL-backed chat session and turn queries"
+    }
+  ],
+  "paths": {
+    "/api/chat/users/{user_id}/sessions": {
+      "get": {
+        "tags": ["chat_history"],
+        "summary": "List chat sessions by user",
+        "description": "Returns sessions for a business user_id, ordered by updated_at descending. Requires mysql_chat / HERMES_MYSQL_* enabled.",
+        "security": [{"BearerAuth": []}],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "description": "Business user identifier"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 100
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "default": 1,
+            "minimum": 1,
+            "description": "Page number (1-based)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session list",
+            "schema": {"$ref": "#/definitions/ChatUserSessionsResponse"},
+            "examples": {
+              "application/json": {
+                "object": "list",
+                "user_id": "10001",
+                "total": 1,
+                "limit": 20,
+                "page": 1,
+                "sessions": [
+                  {
+                    "id": 1,
+                    "session_uid": "a1b2c3d4e5f6789012345678901234567",
+                    "hermes_session_id": "sess_abc123",
+                    "user_id": "10001",
+                    "channel": "api_server",
+                    "status": 1,
+                    "turn_count": 3,
+                    "last_question": "最近一条用户问题",
+                    "updated_at": "2026-05-17T10:30:00"
+                  }
+                ]
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
+          },
+          "503": {
+            "description": "MySQL chat store disabled or unavailable",
+            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
+          }
+        }
+      }
+    },
+    "/api/chat/sessions/{session_id}/turns": {
+      "get": {
+        "tags": ["chat_history"],
+        "summary": "List Q&A turns by session",
+        "description": "Returns Q&A turns ordered by turn_no ascending. session_id: internal id, session_uid, or hermes_session_id.",
+        "security": [{"BearerAuth": []}],
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "description": "Internal id, session_uid, or hermes_session_id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Turn list",
+            "schema": {"$ref": "#/definitions/ChatSessionTurnsResponse"},
+            "examples": {
+              "application/json": {
+                "object": "list",
+                "session": {
+                  "id": 1,
+                  "hermes_session_id": "sess_abc123",
+                  "user_id": "10001"
+                },
+                "total": 2,
+                "turns": [
+                  {
+                    "turn_no": 1,
+                    "question_text": "你好",
+                    "answer_text": "你好，我是 Hermes",
+                    "status": "answered"
+                  },
+                  {
+                    "turn_no": 2,
+                    "question_text": "第二条问题",
+                    "answer_text": "第二条回答",
+                    "status": "answered"
+                  }
+                ]
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
+          },
+          "404": {
+            "description": "Session not found",
+            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
+          },
+          "503": {
+            "description": "MySQL chat store disabled or unavailable",
+            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "OpenAIErrorEnvelope": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": "object",
+          "properties": {
+            "message": {"type": "string"},
+            "type": {"type": "string"}
+          }
+        }
+      }
+    },
+    "ChatSessionSummary": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "integer", "format": "int64"},
+        "session_uid": {"type": "string"},
+        "hermes_session_id": {"type": "string"},
+        "user_id": {"type": "string"},
+        "tenant_id": {"type": "string"},
+        "channel": {"type": "string", "example": "api_server"},
+        "title": {"type": "string"},
+        "status": {"type": "integer", "description": "1=active, 2=closed, 3=archived"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "ended_at": {"type": "string", "format": "date-time"},
+        "created_at": {"type": "string", "format": "date-time"},
+        "updated_at": {"type": "string", "format": "date-time"},
+        "turn_count": {"type": "integer"},
+        "last_question": {"type": "string"}
+      }
+    },
+    "ChatTurnItem": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "integer", "format": "int64"},
+        "session_id": {"type": "integer", "format": "int64"},
+        "user_id": {"type": "string"},
+        "turn_no": {"type": "integer"},
+        "question_message_id": {"type": "integer", "format": "int64"},
+        "answer_message_id": {"type": "integer", "format": "int64"},
+        "question_text": {"type": "string"},
+        "answer_text": {"type": "string"},
+        "status": {
+          "type": "string",
+          "enum": ["answered", "timeout", "error", "interrupted"]
+        },
+        "error_code": {"type": "string"},
+        "error_message": {"type": "string"},
+        "feedback_score": {"type": "integer"},
+        "created_at": {"type": "string", "format": "date-time"},
+        "sql": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/ChatSqlExecutionItem"}
+        }
+      }
+    },
+    "ChatSqlExecutionItem": {
+      "type": "object",
+      "properties": {
+        "sql_content": {"type": "string"},
+        "database": {"type": "string"},
+        "instance": {"type": "string"},
+        "status": {"type": "string", "enum": ["success", "error"]},
+        "tool_call_id": {"type": "string"},
+        "executed_at": {"type": "string", "format": "date-time"},
+        "error_message": {"type": "string"},
+        "query_time_ms": {"type": "number"},
+        "row_count": {"type": "integer"}
+      }
+    },
+    "ChatUserSessionsResponse": {
+      "type": "object",
+      "properties": {
+        "object": {"type": "string", "example": "list"},
+        "user_id": {"type": "string"},
+        "total": {"type": "integer"},
+        "limit": {"type": "integer"},
+        "page": {"type": "integer", "minimum": 1, "example": 1},
+        "sessions": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/ChatSessionSummary"}
+        }
+      }
+    },
+    "ChatSessionTurnsResponse": {
+      "type": "object",
+      "properties": {
+        "object": {"type": "string", "example": "list"},
+        "session": {"$ref": "#/definitions/ChatSessionSummary"},
+        "total": {"type": "integer"},
+        "turns": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/ChatTurnItem"}
+        }
+      }
+    }
+  }
+}

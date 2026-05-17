@@ -907,6 +907,16 @@ DEFAULT_CONFIG = {
         },
     },
     
+    # API server chat history persistence (MySQL). Env vars HERMES_MYSQL_* override.
+    "mysql_chat": {
+        "enabled": False,
+        "host": "",
+        "port": 3306,
+        "user": "root",
+        "password": "",
+        "database": "hermes_agent",
+    },
+
     "display": {
         "compact": False,
         "personality": "kawaii",

@@ -1,0 +1,1750 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Hermes Agent API Server",
+    "description": "Generated from gateway/platforms/api_server.py for YApi import.",
+    "version": "1.0.0"
+  },
+  "host": "127.0.0.1:8642",
+  "basePath": "/",
+  "schemes": [
+    "http"
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "securityDefinitions": {
+    "BearerAuth": {
+      "type": "apiKey",
+      "name": "Authorization",
+      "in": "header",
+      "description": "Format: Bearer <API_SERVER_KEY>"
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "Health and runtime discovery"
+    },
+    {
+      "name": "chat",
+      "description": "OpenAI-compatible chat endpoints"
+    },
+    {
+      "name": "responses",
+      "description": "OpenAI-compatible responses endpoints"
+    },
+    {
+      "name": "runs",
+      "description": "Async run lifecycle endpoints"
+    },
+    {
+      "name": "jobs",
+      "description": "Cron jobs management endpoints"
+    },
+    {
+      "name": "chat_history",
+      "description": "MySQL-backed chat session and turn query endpoints"
+    },
+    {
+      "name": "sse",
+      "description": "SSE-related endpoints and notes"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Health check",
+        "description": "Simple health endpoint.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/HealthResponse"
+            },
+            "examples": {
+              "application/json": {
+                "status": "ok",
+                "platform": "hermes-agent"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/detailed": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Detailed health check",
+        "description": "Detailed gateway runtime status for dashboard probing.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/HealthDetailedResponse"
+            }
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Health check alias",
+        "description": "Alias of /health.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/HealthResponse"
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "List available models",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Model list",
+            "schema": {
+              "$ref": "#/definitions/ModelsResponse"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/v1/capabilities": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Get API capabilities",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Capabilities",
+            "schema": {
+              "$ref": "#/definitions/CapabilitiesResponse"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": [
+          "chat",
+          "sse"
+        ],
+        "summary": "Create chat completion",
+        "description": "OpenAI-compatible chat/completions endpoint. If `stream=true`, returns SSE (`text/event-stream`).",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-Hermes-Session-Id",
+            "in": "header",
+            "required": false,
+            "type": "string",
+            "description": "Continue existing Hermes session"
+          },
+          {
+            "name": "X-Hermes-Session-Key",
+            "in": "header",
+            "required": false,
+            "type": "string",
+            "description": "Stable long-term memory scope key"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "type": "string",
+            "description": "Optional idempotency key"
+          },
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ChatCompletionsRequest"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Non-stream response (JSON) when stream=false",
+            "schema": {
+              "$ref": "#/definitions/ChatCompletionsResponse"
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/v1/responses": {
+      "post": {
+        "tags": [
+          "responses",
+          "sse"
+        ],
+        "summary": "Create response",
+        "description": "OpenAI-compatible responses endpoint. If `stream=true`, returns SSE (`text/event-stream`).",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-Hermes-Session-Key",
+            "in": "header",
+            "required": false,
+            "type": "string",
+            "description": "Stable long-term memory scope key"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "type": "string",
+            "description": "Optional idempotency key"
+          },
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ResponsesRequest"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Non-stream response (JSON) when stream=false",
+            "schema": {
+              "$ref": "#/definitions/ResponsesResponse"
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          },
+          "404": {
+            "description": "Previous response not found",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/v1/responses/{response_id}": {
+      "get": {
+        "tags": [
+          "responses"
+        ],
+        "summary": "Get stored response by ID",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "response_id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored response object",
+            "schema": {
+              "$ref": "#/definitions/ResponsesResponse"
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "responses"
+        ],
+        "summary": "Delete stored response by ID",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "response_id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "schema": {
+              "$ref": "#/definitions/DeleteResponseEnvelope"
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs": {
+      "post": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Create async run",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-Hermes-Session-Key",
+            "in": "header",
+            "required": false,
+            "type": "string",
+            "description": "Stable long-term memory scope key"
+          },
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RunsCreateRequest"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Run started",
+            "schema": {
+              "$ref": "#/definitions/RunsCreateResponse"
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          },
+          "429": {
+            "description": "Concurrency limit reached",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Get run status",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run status",
+            "schema": {
+              "$ref": "#/definitions/RunStatusResponse"
+            }
+          },
+          "404": {
+            "description": "Run not found",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/events": {
+      "get": {
+        "tags": [
+          "runs",
+          "sse"
+        ],
+        "summary": "Subscribe run events (SSE)",
+        "description": "Always SSE (`text/event-stream`). Event payload is JSON in `data:` frames.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "produces": [
+          "text/event-stream"
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream started"
+          },
+          "404": {
+            "description": "Run not found",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/approval": {
+      "post": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Resolve pending run approval",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RunApprovalRequest"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Approval resolved",
+            "schema": {
+              "$ref": "#/definitions/RunApprovalResponse"
+            }
+          },
+          "400": {
+            "description": "Invalid approval choice",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          },
+          "404": {
+            "description": "Run not found",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          },
+          "409": {
+            "description": "No active or pending approval",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/stop": {
+      "post": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Stop run",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stopping signal accepted",
+            "schema": {
+              "$ref": "#/definitions/RunStopResponse"
+            }
+          },
+          "404": {
+            "description": "Run not found",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "List cron jobs",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "include_disabled",
+            "in": "query",
+            "required": false,
+            "type": "boolean",
+            "default": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Jobs list",
+            "schema": {
+              "$ref": "#/definitions/JobsListResponse"
+            }
+          },
+          "501": {
+            "description": "Cron not available",
+            "schema": {
+              "$ref": "#/definitions/SimpleErrorResponse"
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Create cron job",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/JobCreateRequest"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Created",
+            "schema": {
+              "$ref": "#/definitions/JobEnvelope"
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "schema": {
+              "$ref": "#/definitions/SimpleErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Get cron job by ID",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "pattern": "^[a-f0-9]{12}$"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job object",
+            "schema": {
+              "$ref": "#/definitions/JobEnvelope"
+            }
+          },
+          "400": {
+            "description": "Invalid ID format",
+            "schema": {
+              "$ref": "#/definitions/SimpleErrorResponse"
+            }
+          },
+          "404": {
+            "description": "Job not found",
+            "schema": {
+              "$ref": "#/definitions/SimpleErrorResponse"
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Update cron job",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "pattern": "^[a-f0-9]{12}$"
+          },
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/JobUpdateRequest"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "schema": {
+              "$ref": "#/definitions/JobEnvelope"
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "schema": {
+              "$ref": "#/definitions/SimpleErrorResponse"
+            }
+          },
+          "404": {
+            "description": "Job not found",
+            "schema": {
+              "$ref": "#/definitions/SimpleErrorResponse"
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Delete cron job",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "pattern": "^[a-f0-9]{12}$"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "schema": {
+              "$ref": "#/definitions/OkResponse"
+            }
+          },
+          "404": {
+            "description": "Job not found",
+            "schema": {
+              "$ref": "#/definitions/SimpleErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/{job_id}/pause": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Pause cron job",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "pattern": "^[a-f0-9]{12}$"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paused",
+            "schema": {
+              "$ref": "#/definitions/JobEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/{job_id}/resume": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Resume cron job",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "pattern": "^[a-f0-9]{12}$"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resumed",
+            "schema": {
+              "$ref": "#/definitions/JobEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/{job_id}/run": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Trigger cron job now",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "pattern": "^[a-f0-9]{12}$"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Triggered",
+            "schema": {
+              "$ref": "#/definitions/JobEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/api/chat/users/{user_id}/sessions": {
+      "get": {
+        "tags": [
+          "chat_history"
+        ],
+        "summary": "List chat sessions by user",
+        "description": "Returns MySQL-stored sessions for a business user_id, ordered by updated_at descending (most recent first). Requires mysql_chat / HERMES_MYSQL_* to be enabled.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "description": "Business user identifier"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Page size (default 20, max 100)"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "default": 1,
+            "minimum": 1,
+            "description": "Page number (1-based)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session list",
+            "schema": {
+              "$ref": "#/definitions/ChatUserSessionsResponse"
+            },
+            "examples": {
+              "application/json": {
+                "object": "list",
+                "user_id": "10001",
+                "total": 1,
+                "limit": 20,
+                "page": 1,
+                "sessions": [
+                  {
+                    "id": 1,
+                    "session_uid": "a1b2c3d4e5f6789012345678901234567",
+                    "hermes_session_id": "sess_abc123",
+                    "user_id": "10001",
+                    "channel": "api_server",
+                    "status": 1,
+                    "turn_count": 3,
+                    "last_question": "最近一条用户问题",
+                    "started_at": "2026-05-17T10:00:00",
+                    "updated_at": "2026-05-17T10:30:00"
+                  }
+                ]
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          },
+          "503": {
+            "description": "MySQL chat store disabled or unavailable",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "/api/chat/sessions/{session_id}/turns": {
+      "get": {
+        "tags": [
+          "chat_history"
+        ],
+        "summary": "List Q&A turns by session",
+        "description": "Returns Q&A turns for a session ordered by turn_no ascending (first turn at top). session_id may be the internal numeric id, session_uid, or hermes_session_id (X-Hermes-Session-Id).",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "description": "Internal id, session_uid, or hermes_session_id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Turn list",
+            "schema": {
+              "$ref": "#/definitions/ChatSessionTurnsResponse"
+            },
+            "examples": {
+              "application/json": {
+                "object": "list",
+                "session": {
+                  "id": 1,
+                  "session_uid": "a1b2c3d4e5f6789012345678901234567",
+                  "hermes_session_id": "sess_abc123",
+                  "user_id": "10001",
+                  "channel": "api_server"
+                },
+                "total": 2,
+                "turns": [
+                  {
+                    "turn_no": 1,
+                    "question_text": "你好",
+                    "answer_text": "你好，我是 Hermes",
+                    "status": "answered",
+                    "created_at": "2026-05-17T10:00:01"
+                  },
+                  {
+                    "turn_no": 2,
+                    "question_text": "第二条问题",
+                    "answer_text": "第二条回答",
+                    "status": "answered",
+                    "created_at": "2026-05-17T10:05:01"
+                  }
+                ]
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          },
+          "503": {
+            "description": "MySQL chat store disabled or unavailable",
+            "schema": {
+              "$ref": "#/definitions/OpenAIErrorEnvelope"
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "HealthResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        }
+      }
+    },
+    "HealthDetailedResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "gateway_state": {
+          "type": "string"
+        },
+        "platforms": {
+          "type": "object"
+        },
+        "active_agents": {
+          "type": "integer"
+        },
+        "exit_reason": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer"
+        }
+      }
+    },
+    "OpenAIErrorEnvelope": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "code": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "SimpleErrorResponse": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "ModelsResponse": {
+      "type": "object",
+      "properties": {
+        "object": {
+          "type": "string"
+        },
+        "data": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "object": {
+                "type": "string"
+              },
+              "created": {
+                "type": "integer"
+              },
+              "owned_by": {
+                "type": "string"
+              },
+              "root": {
+                "type": "string"
+              },
+              "parent": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "CapabilitiesResponse": {
+      "type": "object",
+      "properties": {
+        "object": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "auth": {
+          "type": "object"
+        },
+        "runtime": {
+          "type": "object"
+        },
+        "features": {
+          "type": "object"
+        },
+        "endpoints": {
+          "type": "object"
+        }
+      }
+    },
+    "ChatMessage": {
+      "type": "object",
+      "required": [
+        "role",
+        "content"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": [
+            "system",
+            "user",
+            "assistant"
+          ]
+        },
+        "content": {
+          "description": "String or multimodal content list",
+          "type": "object"
+        }
+      }
+    },
+    "ChatCompletionsRequest": {
+      "type": "object",
+      "required": [
+        "messages"
+      ],
+      "properties": {
+        "model": {
+          "type": "string",
+          "example": "hermes-agent"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ChatMessage"
+          }
+        },
+        "stream": {
+          "type": "boolean",
+          "default": false
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "tool_choice": {
+          "type": "object"
+        }
+      }
+    },
+    "ChatCompletionsResponse": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "object": {
+          "type": "string"
+        },
+        "created": {
+          "type": "integer"
+        },
+        "model": {
+          "type": "string"
+        },
+        "choices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "index": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "object",
+                "properties": {
+                  "role": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  }
+                }
+              },
+              "finish_reason": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "usage": {
+          "$ref": "#/definitions/TokenUsage"
+        }
+      }
+    },
+    "ResponsesRequest": {
+      "type": "object",
+      "required": [
+        "input"
+      ],
+      "properties": {
+        "model": {
+          "type": "string",
+          "example": "hermes-agent"
+        },
+        "input": {
+          "description": "string or message[]",
+          "type": "object"
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "previous_response_id": {
+          "type": "string"
+        },
+        "conversation": {
+          "type": "string"
+        },
+        "conversation_history": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "store": {
+          "type": "boolean",
+          "default": true
+        },
+        "stream": {
+          "type": "boolean",
+          "default": false
+        },
+        "truncation": {
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        }
+      }
+    },
+    "ResponsesResponse": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "object": {
+          "type": "string",
+          "example": "response"
+        },
+        "status": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer"
+        },
+        "model": {
+          "type": "string"
+        },
+        "output": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "usage": {
+          "$ref": "#/definitions/TokenUsage"
+        }
+      }
+    },
+    "DeleteResponseEnvelope": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "object": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "RunsCreateRequest": {
+      "type": "object",
+      "required": [
+        "input"
+      ],
+      "properties": {
+        "model": {
+          "type": "string",
+          "example": "hermes-agent"
+        },
+        "input": {
+          "description": "string or message[]",
+          "type": "object"
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "previous_response_id": {
+          "type": "string"
+        },
+        "conversation_history": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "session_id": {
+          "type": "string"
+        }
+      }
+    },
+    "RunsCreateResponse": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "example": "started"
+        }
+      }
+    },
+    "RunStatusResponse": {
+      "type": "object",
+      "description": "Dynamic run status object; shape depends on lifecycle state.",
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "number"
+        },
+        "updated_at": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/definitions/TokenUsage"
+        }
+      }
+    },
+    "RunApprovalRequest": {
+      "type": "object",
+      "required": [
+        "choice"
+      ],
+      "properties": {
+        "choice": {
+          "type": "string",
+          "enum": [
+            "once",
+            "session",
+            "always",
+            "deny",
+            "approve",
+            "approved",
+            "allow"
+          ]
+        },
+        "all": {
+          "type": "boolean"
+        },
+        "resolve_all": {
+          "type": "boolean"
+        }
+      }
+    },
+    "RunApprovalResponse": {
+      "type": "object",
+      "properties": {
+        "object": {
+          "type": "string",
+          "example": "hermes.run.approval_response"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "choice": {
+          "type": "string"
+        },
+        "resolved": {
+          "type": "integer"
+        }
+      }
+    },
+    "RunStopResponse": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "example": "stopping"
+        }
+      }
+    },
+    "TokenUsage": {
+      "type": "object",
+      "properties": {
+        "input_tokens": {
+          "type": "integer"
+        },
+        "output_tokens": {
+          "type": "integer"
+        },
+        "total_tokens": {
+          "type": "integer"
+        }
+      }
+    },
+    "JobCreateRequest": {
+      "type": "object",
+      "required": [
+        "name",
+        "schedule"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "schedule": {
+          "type": "string"
+        },
+        "prompt": {
+          "type": "string",
+          "maxLength": 5000
+        },
+        "deliver": {
+          "type": "string",
+          "default": "local"
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "repeat": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "JobUpdateRequest": {
+      "type": "object",
+      "description": "Allowed fields: name, schedule, prompt, deliver, skills, skill, repeat, enabled",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "schedule": {
+          "type": "string"
+        },
+        "prompt": {
+          "type": "string",
+          "maxLength": 5000
+        },
+        "deliver": {
+          "type": "string"
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "skill": {
+          "type": "string"
+        },
+        "repeat": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "JobEnvelope": {
+      "type": "object",
+      "properties": {
+        "job": {
+          "type": "object"
+        }
+      }
+    },
+    "JobsListResponse": {
+      "type": "object",
+      "properties": {
+        "jobs": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "OkResponse": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ChatSessionSummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "session_uid": {
+          "type": "string"
+        },
+        "hermes_session_id": {
+          "type": "string"
+        },
+        "user_id": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "channel": {
+          "type": "string",
+          "example": "api_server"
+        },
+        "title": {
+          "type": "string"
+        },
+        "status": {
+          "type": "integer",
+          "description": "1=active, 2=closed, 3=archived"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "turn_count": {
+          "type": "integer"
+        },
+        "last_question": {
+          "type": "string"
+        }
+      }
+    },
+    "ChatTurnItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "session_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "user_id": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "turn_no": {
+          "type": "integer",
+          "description": "Turn index starting at 1"
+        },
+        "question_message_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "answer_message_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "question_text": {
+          "type": "string"
+        },
+        "answer_text": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "answered",
+            "timeout",
+            "error",
+            "interrupted"
+          ]
+        },
+        "error_code": {
+          "type": "string"
+        },
+        "error_message": {
+          "type": "string"
+        },
+        "feedback_score": {
+          "type": "integer"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "ChatUserSessionsResponse": {
+      "type": "object",
+      "properties": {
+        "object": {
+          "type": "string",
+          "example": "list"
+        },
+        "user_id": {
+          "type": "string"
+        },
+        "total": {
+          "type": "integer"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "page": {
+          "type": "integer",
+          "minimum": 1,
+          "example": 1
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ChatSessionSummary"
+          }
+        }
+      }
+    },
+    "ChatSessionTurnsResponse": {
+      "type": "object",
+      "properties": {
+        "object": {
+          "type": "string",
+          "example": "list"
+        },
+        "session": {
+          "$ref": "#/definitions/ChatSessionSummary"
+        },
+        "total": {
+          "type": "integer"
+        },
+        "turns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ChatTurnItem"
+          }
+        }
+      }
+    }
+  }
+}
