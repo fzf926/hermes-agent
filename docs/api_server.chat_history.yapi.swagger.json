@@ -211,7 +211,20 @@
         "sql": {
           "type": "array",
           "items": {"$ref": "#/definitions/ChatSqlExecutionItem"}
-        }
+        },
+        "conversation": {"$ref": "#/definitions/ChatConversationFulfillment"}
+      }
+    },
+    "ChatConversationFulfillment": {
+      "type": "object",
+      "description": "LLM judge result for whether the turn satisfied user intent",
+      "properties": {
+        "fulfillment_status": {
+          "type": "string",
+          "enum": ["satisfied", "partial", "unsatisfied", "unknown"]
+        },
+        "fulfillment_reason": {"type": "string"},
+        "is_final": {"type": "boolean"}
       }
     },
     "ChatSqlExecutionItem": {

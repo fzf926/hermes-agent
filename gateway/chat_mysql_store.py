@@ -21,6 +21,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from gateway.fulfillment_judge import conversation_for_api
 from gateway.sql_execution import sql_records_for_turn_api
 
 logger = logging.getLogger(__name__)
@@ -200,6 +201,9 @@ class ChatMySQLStore:
         run_id: Optional[str] = None,
         status: str = "answered",
         error_message: Optional[str] = None,
+        fulfillment_status: Optional[str] = None,
+        fulfillment_reason: Optional[str] = None,
+        is_final: Optional[bool] = None,
     ) -> Dict[str, int]:
         usage = usage or {}
         prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
@@ -210,6 +214,14 @@ class ChatMySQLStore:
 
         if status not in {"answered", "timeout", "error", "interrupted"}:
             status = "error" if error_message else "answered"
+
+        fs = (fulfillment_status or "").strip().lower() or None
+        if fs and fs not in {"satisfied", "partial", "unsatisfied", "unknown"}:
+            fs = "unknown"
+        fr = (fulfillment_reason or "")[:512] if fulfillment_reason else None
+        is_final_db = None
+        if is_final is not None:
+            is_final_db = 1 if is_final else 0
 
         hermes_response_ref = response_id or completion_id
 
@@ -281,8 +293,9 @@ class ChatMySQLStore:
                     INSERT INTO chat_turn (
                         session_id, user_id, tenant_id, turn_no,
                         question_message_id, answer_message_id,
-                        question_text, answer_text, status, error_message
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        question_text, answer_text, status, error_message,
+                        fulfillment_status, fulfillment_reason, is_final
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         session_id,
@@ -295,6 +308,9 @@ class ChatMySQLStore:
                         answer_text,
                         status,
                         (error_message or "")[:512] if error_message else None,
+                        fs,
+                        fr,
+                        is_final_db,
                     ),
                 )
                 turn_id = int(cur.lastrowid)
@@ -499,6 +515,9 @@ class ChatMySQLStore:
                         status,
                         error_code,
                         error_message,
+                        fulfillment_status,
+                        fulfillment_reason,
+                        is_final,
                         feedback_score,
                         created_at
                     FROM chat_turn
@@ -532,6 +551,15 @@ class ChatMySQLStore:
                     tid = turn.get("id")
                     rows = sql_by_turn.get(int(tid), []) if tid is not None else []
                     turn["sql"] = sql_records_for_turn_api(rows)
+                    if turn.get("fulfillment_status"):
+                        _is_final = turn.get("is_final")
+                        turn["conversation"] = conversation_for_api(
+                            {
+                                "fulfillment_status": turn.get("fulfillment_status"),
+                                "fulfillment_reason": turn.get("fulfillment_reason") or "",
+                                "is_final": bool(_is_final) if _is_final is not None else True,
+                            }
+                        )
         finally:
             conn.close()
 

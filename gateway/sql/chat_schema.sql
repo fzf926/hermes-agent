@@ -62,6 +62,10 @@ CREATE TABLE IF NOT EXISTS chat_turn (
   status ENUM('answered','timeout','error','interrupted') NOT NULL DEFAULT 'answered',
   error_code VARCHAR(64) DEFAULT NULL,
   error_message VARCHAR(512) DEFAULT NULL,
+  fulfillment_status ENUM('satisfied','partial','unsatisfied','unknown') DEFAULT NULL
+    COMMENT 'LLM judge: whether user intent was met',
+  fulfillment_reason VARCHAR(512) DEFAULT NULL COMMENT 'LLM judge explanation',
+  is_final TINYINT(1) DEFAULT NULL COMMENT '1=no follow-up needed for this ask',
   feedback_score TINYINT DEFAULT NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),

@@ -879,6 +879,14 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
         },
+        "fulfillment_judge": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 45,
+            "extra_body": {},
+        },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
@@ -915,6 +923,8 @@ DEFAULT_CONFIG = {
         "user": "root",
         "password": "",
         "database": "hermes_agent",
+        # After each API chat turn, auxiliary LLM judges intent fulfillment.
+        "fulfillment_judge_enabled": True,
     },
 
     "display": {
