@@ -58,6 +58,7 @@ from gateway.sql_execution import (
     sql_records_for_api,
     sql_results_display_for_api,
 )
+from gateway.tool_call_log import capture_tool_call_record
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,26 @@ def _append_dbops_sql_record(
     )
     if rec:
         sql_records.append(rec)
+
+
+def _append_tool_call_record(
+    tool_call_records: List[Dict[str, Any]],
+    tool_call_id: Optional[str],
+    function_name: str,
+    function_args: Any,
+    function_result: Any,
+    *,
+    latency_ms: Optional[int] = None,
+) -> None:
+    rec = capture_tool_call_record(
+        tool_call_id,
+        function_name,
+        function_args,
+        function_result,
+        latency_ms=latency_ms,
+    )
+    if rec:
+        tool_call_records.append(rec)
 
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
@@ -829,6 +850,7 @@ class APIServerAdapter(BasePlatformAdapter):
         status: str = "answered",
         error_message: Optional[str] = None,
         sql_executions: Optional[List[Dict[str, Any]]] = None,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
         fulfillment_status: Optional[str] = None,
         fulfillment_reason: Optional[str] = None,
         is_final: Optional[bool] = None,
@@ -869,6 +891,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     turn_id=meta["turn_id"],
                     user_id=user_id,
                     executions=sql_executions,
+                )
+            if tool_calls and meta:
+                store.save_tool_calls(
+                    session_id=meta["session_id"],
+                    turn_id=meta["turn_id"],
+                    user_id=user_id,
+                    calls=tool_calls,
                 )
 
         try:
@@ -1446,6 +1475,8 @@ class APIServerAdapter(BasePlatformAdapter):
         model_name = body.get("model", self._model_name)
         created = int(time.time())
         sql_records: List[Dict[str, Any]] = []
+        tool_call_records: List[Dict[str, Any]] = []
+        tool_call_started_at: Dict[str, float] = {}
 
         if stream:
             import queue as _q
@@ -1483,6 +1514,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if not tool_call_id or function_name.startswith("_"):
                     return
+                tool_call_started_at[tool_call_id] = time.monotonic()
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
@@ -1503,6 +1535,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 _append_dbops_sql_record(
                     sql_records, tool_call_id, function_name, function_args, function_result
+                )
+                started_at = tool_call_started_at.pop(tool_call_id, None)
+                _append_tool_call_record(
+                    tool_call_records,
+                    tool_call_id,
+                    function_name,
+                    function_args,
+                    function_result,
+                    latency_ms=(
+                        int((time.monotonic() - started_at) * 1000)
+                        if started_at is not None
+                        else None
+                    ),
                 )
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
@@ -1544,13 +1589,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 mysql_user_id=user_id,
                 mysql_question_text=self._content_to_storage_text(user_message),
                 sql_records=sql_records,
+                tool_call_records=tool_call_records,
             )
+
+        def _on_tool_start_nonstream(tool_call_id, function_name, function_args):
+            if tool_call_id and not function_name.startswith("_"):
+                tool_call_started_at[tool_call_id] = time.monotonic()
 
         def _on_tool_complete_nonstream(
             tool_call_id, function_name, function_args, function_result
         ):
             _append_dbops_sql_record(
                 sql_records, tool_call_id, function_name, function_args, function_result
+            )
+            started_at = tool_call_started_at.pop(tool_call_id, None)
+            _append_tool_call_record(
+                tool_call_records,
+                tool_call_id,
+                function_name,
+                function_args,
+                function_result,
+                latency_ms=(
+                    int((time.monotonic() - started_at) * 1000)
+                    if started_at is not None
+                    else None
+                ),
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1561,6 +1624,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_start_callback=_on_tool_start_nonstream,
                 tool_complete_callback=_on_tool_complete_nonstream,
             )
 
@@ -1690,6 +1754,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=turn_status,
                 error_message=err_msg,
                 sql_executions=sql_records or None,
+                tool_calls=tool_call_records or None,
                 fulfillment_status=fulfillment.get("fulfillment_status"),
                 fulfillment_reason=fulfillment.get("fulfillment_reason"),
                 is_final=fulfillment.get("is_final"),
@@ -1704,6 +1769,7 @@ class APIServerAdapter(BasePlatformAdapter):
         mysql_user_id: Optional[str] = None,
         mysql_question_text: Optional[str] = None,
         sql_records: Optional[List[Dict[str, Any]]] = None,
+        tool_call_records: Optional[List[Dict[str, Any]]] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1714,6 +1780,7 @@ class APIServerAdapter(BasePlatformAdapter):
         import queue as _q
 
         sql_records = sql_records if sql_records is not None else []
+        tool_call_records = tool_call_records if tool_call_records is not None else []
 
         sse_headers = {
             "Content-Type": "text/event-stream",
@@ -1841,6 +1908,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         status=turn_status,
                         error_message=err_msg,
                         sql_executions=sql_records or None,
+                        tool_calls=tool_call_records or None,
                         fulfillment_status=fulfillment.get("fulfillment_status"),
                         fulfillment_reason=fulfillment.get("fulfillment_reason"),
                         is_final=fulfillment.get("is_final"),
@@ -1917,6 +1985,7 @@ class APIServerAdapter(BasePlatformAdapter):
         mysql_user_id: Optional[str] = None,
         mysql_question_text: Optional[str] = None,
         sql_records: Optional[List[Dict[str, Any]]] = None,
+        tool_call_records: Optional[List[Dict[str, Any]]] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -1949,6 +2018,7 @@ class APIServerAdapter(BasePlatformAdapter):
         import queue as _q
 
         sql_records = sql_records if sql_records is not None else []
+        tool_call_records = tool_call_records if tool_call_records is not None else []
 
         sse_headers = {
             "Content-Type": "text/event-stream",
@@ -2470,6 +2540,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=stream_turn_status,
                     error_message=agent_error,
                     sql_executions=sql_records or None,
+                    tool_calls=tool_call_records or None,
                     fulfillment_status=stream_fulfillment.get("fulfillment_status"),
                     fulfillment_reason=stream_fulfillment.get("fulfillment_reason"),
                     is_final=stream_fulfillment.get("is_final"),
@@ -2646,6 +2717,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
         sql_records: List[Dict[str, Any]] = []
+        tool_call_records: List[Dict[str, Any]] = []
+        tool_call_started_at: Dict[str, float] = {}
 
         stream = bool(body.get("stream", False))
         if stream:
@@ -2673,6 +2746,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Queue a started tool for live function_call streaming."""
+                if tool_call_id and not function_name.startswith("_"):
+                    tool_call_started_at[tool_call_id] = time.monotonic()
                 _stream_q.put(("__tool_started__", {
                     "tool_call_id": tool_call_id,
                     "name": function_name,
@@ -2683,6 +2758,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 """Queue a completed tool result for live function_call_output streaming."""
                 _append_dbops_sql_record(
                     sql_records, tool_call_id, function_name, function_args, function_result
+                )
+                started_at = tool_call_started_at.pop(tool_call_id, None)
+                _append_tool_call_record(
+                    tool_call_records,
+                    tool_call_id,
+                    function_name,
+                    function_args,
+                    function_result,
+                    latency_ms=(
+                        int((time.monotonic() - started_at) * 1000)
+                        if started_at is not None
+                        else None
+                    ),
                 )
                 _stream_q.put(("__tool_completed__", {
                     "tool_call_id": tool_call_id,
@@ -2730,13 +2818,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 mysql_user_id=user_id,
                 mysql_question_text=self._content_to_storage_text(user_message),
                 sql_records=sql_records,
+                tool_call_records=tool_call_records,
             )
+
+        def _on_tool_start_responses(tool_call_id, function_name, function_args):
+            if tool_call_id and not function_name.startswith("_"):
+                tool_call_started_at[tool_call_id] = time.monotonic()
 
         def _on_tool_complete_responses(
             tool_call_id, function_name, function_args, function_result
         ):
             _append_dbops_sql_record(
                 sql_records, tool_call_id, function_name, function_args, function_result
+            )
+            started_at = tool_call_started_at.pop(tool_call_id, None)
+            _append_tool_call_record(
+                tool_call_records,
+                tool_call_id,
+                function_name,
+                function_args,
+                function_result,
+                latency_ms=(
+                    int((time.monotonic() - started_at) * 1000)
+                    if started_at is not None
+                    else None
+                ),
             )
 
         async def _compute_response():
@@ -2746,6 +2852,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_start_callback=_on_tool_start_responses,
                 tool_complete_callback=_on_tool_complete_responses,
             )
 
@@ -2855,6 +2962,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=resp_turn_status,
                 error_message=result.get("error"),
                 sql_executions=sql_records or None,
+                tool_calls=tool_call_records or None,
                 fulfillment_status=fulfillment.get("fulfillment_status"),
                 fulfillment_reason=fulfillment.get("fulfillment_reason"),
                 is_final=fulfillment.get("is_final"),

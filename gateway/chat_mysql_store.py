@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from gateway.fulfillment_judge import conversation_for_api
 from gateway.sql_execution import sql_records_for_turn_api
+from gateway.tool_call_log import json_dumps_for_mysql, tool_call_rows_for_turn_api
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ def _rows_to_dicts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 class ChatMySQLStore:
-    """Synchronous MySQL access for chat_session / chat_message / chat_turn / chat_sql_execution."""
+    """Synchronous MySQL access for chat persistence tables."""
 
     def __init__(self, config: MySQLConfig):
         if pymysql is None:
@@ -385,6 +386,55 @@ class ChatMySQLStore:
         finally:
             conn.close()
 
+    def save_tool_calls(
+        self,
+        *,
+        session_id: int,
+        turn_id: Optional[int],
+        user_id: str,
+        calls: List[Dict[str, Any]],
+    ) -> None:
+        """Persist generic tool calls linked to a chat turn."""
+        if not calls:
+            return
+
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                for rec in calls:
+                    tool_name = str(rec.get("tool_name") or "").strip()[:128]
+                    if not tool_name:
+                        continue
+                    status = str(rec.get("status") or "success").strip().lower()
+                    if status not in {"success", "failed", "timeout"}:
+                        status = "failed" if rec.get("error") else "success"
+                    latency_ms = rec.get("latency_ms")
+                    cur.execute(
+                        """
+                        INSERT INTO chat_tool_call (
+                            session_id, turn_id, message_id, user_id,
+                            tool_name, tool_args, tool_result, status, latency_ms
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            session_id,
+                            turn_id,
+                            rec.get("message_id"),
+                            user_id,
+                            tool_name,
+                            json_dumps_for_mysql(rec.get("tool_args")),
+                            json_dumps_for_mysql(rec.get("tool_result")),
+                            status,
+                            int(latency_ms) if latency_ms is not None else None,
+                        ),
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def list_sessions_by_user_id(
         self,
         user_id: str,
@@ -529,6 +579,7 @@ class ChatMySQLStore:
                 turns = _rows_to_dicts(list(cur.fetchall()))
 
                 sql_by_turn: Dict[int, List[Dict[str, Any]]] = {}
+                tool_calls_by_turn: Dict[int, List[Dict[str, Any]]] = {}
                 if turns:
                     cur.execute(
                         """
@@ -547,10 +598,31 @@ class ChatMySQLStore:
                             continue
                         sql_by_turn.setdefault(int(tid), []).append(_row_to_dict(row))
 
+                    cur.execute(
+                        """
+                        SELECT
+                            id, turn_id, tool_name, tool_args, tool_result,
+                            status, latency_ms, created_at
+                        FROM chat_tool_call
+                        WHERE session_id = %s
+                        ORDER BY turn_id ASC, id ASC
+                        """,
+                        (session_id,),
+                    )
+                    for row in cur.fetchall():
+                        tid = row.get("turn_id")
+                        if tid is None:
+                            continue
+                        tool_calls_by_turn.setdefault(int(tid), []).append(_row_to_dict(row))
+
                 for turn in turns:
                     tid = turn.get("id")
                     rows = sql_by_turn.get(int(tid), []) if tid is not None else []
                     turn["sql"] = sql_records_for_turn_api(rows)
+                    tool_rows = (
+                        tool_calls_by_turn.get(int(tid), []) if tid is not None else []
+                    )
+                    turn["tool_calls"] = tool_call_rows_for_turn_api(tool_rows)
                     if turn.get("fulfillment_status"):
                         _is_final = turn.get("is_final")
                         turn["conversation"] = conversation_for_api(
