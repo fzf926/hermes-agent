@@ -61,7 +61,12 @@ from gateway.sql_execution import (
 from gateway.tool_call_log import capture_tool_call_record
 from gateway.chat_conversation_context import (
     merge_ephemeral_system_prompt,
+    parse_conversation_type,
     resolve_conversation_context,
+)
+from gateway.chat_mysql_store import (
+    ConversationTypeMismatchError,
+    parse_conversation_types_filter,
 )
 
 logger = logging.getLogger(__name__)
@@ -855,6 +860,41 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, None, result.early_reply
         return merge_ephemeral_system_prompt(base_prompt, result.extra_prompt), None, None
 
+    async def _assert_mysql_session_conversation_type(
+        self,
+        *,
+        user_id: str,
+        hermes_session_id: str,
+        conversation_type: int,
+    ) -> Optional["web.Response"]:
+        """Return 400 if an existing MySQL session has a different conversation_type."""
+        store = self._get_chat_mysql_store()
+        if not store or not user_id or not hermes_session_id:
+            return None
+
+        def _check():
+            store.check_session_conversation_type(
+                user_id=user_id,
+                hermes_session_id=hermes_session_id,
+                conversation_type=conversation_type,
+            )
+
+        try:
+            await self._run_mysql_chat_query(_check)
+        except ConversationTypeMismatchError:
+            return web.json_response(
+                _openai_error("当前对话类型异常", err_type="invalid_request_error"),
+                status=400,
+            )
+        except Exception as exc:
+            logger.warning(
+                "conversation_type check failed user=%s session=%s: %s",
+                user_id,
+                hermes_session_id,
+                exc,
+            )
+        return None
+
     async def _return_prompt_only_chat_completion(
         self,
         request: "web.Request",
@@ -869,6 +909,7 @@ class APIServerAdapter(BasePlatformAdapter):
         user_id: Optional[str],
         user_message_text: str,
         stream: bool,
+        conversation_type: int = 3,
     ) -> "web.Response":
         """Return a guided reply without running the agent (direct SQL missing)."""
         response_headers = {"X-Hermes-Session-Id": session_id}
@@ -946,6 +987,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 usage=response_data["usage"],
                 completion_id=completion_id,
                 status="answered",
+                conversation_type=conversation_type,
             )
         return web.json_response(response_data, headers=response_headers)
 
@@ -960,6 +1002,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str],
         user_id: Optional[str],
         stream: bool,
+        conversation_type: int = 3,
     ) -> "web.Response":
         """Responses API: guided reply when direct SQL is missing."""
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
@@ -989,6 +1032,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                         response_id=response_id,
                         status="answered",
+                        conversation_type=conversation_type,
                     )
 
             persist_task = asyncio.create_task(_persist_direct_sql_prompt())
@@ -1048,6 +1092,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 usage=response_data["usage"],
                 response_id=response_id,
                 status="answered",
+                conversation_type=conversation_type,
             )
         return web.json_response(response_data, headers=response_headers)
 
@@ -1091,6 +1136,7 @@ class APIServerAdapter(BasePlatformAdapter):
         fulfillment_status: Optional[str] = None,
         fulfillment_reason: Optional[str] = None,
         is_final: Optional[bool] = None,
+        conversation_type: int = 1,
     ) -> None:
         store = self._get_chat_mysql_store()
         if not store:
@@ -1121,6 +1167,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 fulfillment_status=fulfillment_status,
                 fulfillment_reason=fulfillment_reason,
                 is_final=is_final,
+                conversation_type=conversation_type,
             )
             if sql_executions and meta:
                 store.save_sql_executions(
@@ -1145,6 +1192,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 hermes_session_id,
                 status,
                 len(sql_executions or []),
+            )
+        except ConversationTypeMismatchError:
+            logger.warning(
+                "MySQL chat persist rejected: conversation_type mismatch "
+                "user_id=%s session=%s",
+                user_id,
+                hermes_session_id,
             )
         except Exception as exc:
             logger.warning("Failed to persist chat to MySQL: %s", exc, exc_info=True)
@@ -1275,11 +1329,19 @@ class APIServerAdapter(BasePlatformAdapter):
             return id_err
 
         limit, page = self._parse_pagination(request)
+        conv_types = parse_conversation_types_filter(
+            request.query.get("conversation_type")
+        )
         store = self._get_chat_mysql_store()
 
         try:
             result = await self._run_mysql_chat_query(
-                lambda: store.list_sessions_by_user_id(user_id, limit=limit, page=page)
+                lambda: store.list_sessions_by_user_id(
+                    user_id,
+                    limit=limit,
+                    page=page,
+                    conversation_types=conv_types,
+                )
             )
             return web.json_response(result)
         except Exception as exc:
@@ -1883,6 +1945,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if conv_err is not None:
             return conv_err
 
+        conversation_type = parse_conversation_type(body)
+        if user_id:
+            type_err = await self._assert_mysql_session_conversation_type(
+                user_id=user_id,
+                hermes_session_id=session_id,
+                conversation_type=conversation_type,
+            )
+            if type_err is not None:
+                return type_err
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -1900,6 +1972,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_id=user_id,
                 user_message_text=user_message_text,
                 stream=stream,
+                conversation_type=conversation_type,
             )
 
         sql_records: List[Dict[str, Any]] = []
@@ -2016,6 +2089,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 mysql_user_id=user_id,
                 mysql_question_text=self._content_to_storage_text(user_message),
+                mysql_conversation_type=conversation_type,
                 sql_records=sql_records,
                 tool_call_records=tool_call_records,
             )
@@ -2186,6 +2260,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 fulfillment_status=fulfillment.get("fulfillment_status"),
                 fulfillment_reason=fulfillment.get("fulfillment_reason"),
                 is_final=fulfillment.get("is_final"),
+                conversation_type=conversation_type,
             )
 
         return web.json_response(response_data, headers=response_headers)
@@ -2196,6 +2271,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: str = None,
         mysql_user_id: Optional[str] = None,
         mysql_question_text: Optional[str] = None,
+        mysql_conversation_type: int = 1,
         sql_records: Optional[List[Dict[str, Any]]] = None,
         tool_call_records: Optional[List[Dict[str, Any]]] = None,
     ) -> "web.StreamResponse":
@@ -2340,6 +2416,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         fulfillment_status=fulfillment.get("fulfillment_status"),
                         fulfillment_reason=fulfillment.get("fulfillment_reason"),
                         is_final=fulfillment.get("is_final"),
+                        conversation_type=mysql_conversation_type,
                     )
 
             # Finish chunk
@@ -2412,6 +2489,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         mysql_user_id: Optional[str] = None,
         mysql_question_text: Optional[str] = None,
+        mysql_conversation_type: int = 1,
         sql_records: Optional[List[Dict[str, Any]]] = None,
         tool_call_records: Optional[List[Dict[str, Any]]] = None,
     ) -> "web.StreamResponse":
@@ -2972,6 +3050,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     fulfillment_status=stream_fulfillment.get("fulfillment_status"),
                     fulfillment_reason=stream_fulfillment.get("fulfillment_reason"),
                     is_final=stream_fulfillment.get("is_final"),
+                    conversation_type=mysql_conversation_type,
                 )
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -3149,7 +3228,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if conv_err is not None:
             return conv_err
 
+        conversation_type = parse_conversation_type(body)
         session_id = stored_session_id or str(uuid.uuid4())
+        if user_id:
+            type_err = await self._assert_mysql_session_conversation_type(
+                user_id=user_id,
+                hermes_session_id=session_id,
+                conversation_type=conversation_type,
+            )
+            if type_err is not None:
+                return type_err
+
         stream = bool(body.get("stream", False))
 
         if conv_early_reply:
@@ -3162,6 +3251,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 user_id=user_id,
                 stream=stream,
+                conversation_type=conversation_type,
             )
 
         # Truncation support
@@ -3268,6 +3358,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 mysql_user_id=user_id,
                 mysql_question_text=self._content_to_storage_text(user_message),
+                mysql_conversation_type=conversation_type,
                 sql_records=sql_records,
                 tool_call_records=tool_call_records,
             )
@@ -3417,6 +3508,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 fulfillment_status=fulfillment.get("fulfillment_status"),
                 fulfillment_reason=fulfillment.get("fulfillment_reason"),
                 is_final=fulfillment.get("is_final"),
+                conversation_type=conversation_type,
             )
 
         return web.json_response(response_data, headers=response_headers)
@@ -3990,6 +4082,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         user_message_text = user_message if isinstance(user_message, str) else str(user_message)
+        user_id = self._parse_user_id(request, body)
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
@@ -4003,6 +4096,16 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if conv_err is not None:
             return conv_err
+
+        conversation_type = parse_conversation_type(body)
+        if user_id:
+            type_err = await self._assert_mysql_session_conversation_type(
+                user_id=user_id,
+                hermes_session_id=session_id,
+                conversation_type=conversation_type,
+            )
+            if type_err is not None:
+                return type_err
 
         if conv_early_reply:
             loop = asyncio.get_running_loop()

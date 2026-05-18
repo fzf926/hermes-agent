@@ -31,6 +31,55 @@ from gateway.tool_call_log import json_dumps_for_mysql, tool_call_rows_for_turn_
 
 logger = logging.getLogger(__name__)
 
+CONVERSATION_TYPE_HISTORY = 1
+CONVERSATION_TYPE_FAVORITE = 2
+CONVERSATION_TYPE_DIRECT = 3
+_VALID_CONVERSATION_TYPES = frozenset(
+    {CONVERSATION_TYPE_HISTORY, CONVERSATION_TYPE_FAVORITE, CONVERSATION_TYPE_DIRECT}
+)
+# Default session list for "normal history" API (excludes favorite-mode sessions).
+DEFAULT_HISTORY_SESSION_CONVERSATION_TYPES = (
+    CONVERSATION_TYPE_HISTORY,
+    CONVERSATION_TYPE_DIRECT,
+)
+
+
+class ConversationTypeMismatchError(ValueError):
+    """Raised when request conversation_type does not match the session's stored type."""
+
+    def __init__(self, message: str = "当前对话类型异常"):
+        super().__init__(message)
+        self.message = message
+
+
+def normalize_conversation_type(value: Any, *, default: int = CONVERSATION_TYPE_HISTORY) -> int:
+    try:
+        n = int(value)
+        if n in _VALID_CONVERSATION_TYPES:
+            return n
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
+def parse_conversation_types_filter(raw: Optional[str]) -> List[int]:
+    """Parse query param conversation_type (e.g. ``1``, ``3``, ``1,3``)."""
+    if raw is None or not str(raw).strip():
+        return list(DEFAULT_HISTORY_SESSION_CONVERSATION_TYPES)
+    out: List[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            n = int(part)
+            if n in _VALID_CONVERSATION_TYPES and n not in out:
+                out.append(n)
+        except ValueError:
+            continue
+    return out or list(DEFAULT_HISTORY_SESSION_CONVERSATION_TYPES)
+
+
 try:
     import pymysql
     from pymysql.cursors import DictCursor
@@ -158,10 +207,12 @@ class ChatMySQLStore:
         hermes_session_id: str,
         channel: str,
         tenant_id: Optional[str] = None,
+        conversation_type: int = CONVERSATION_TYPE_HISTORY,
     ) -> int:
+        conv_type = normalize_conversation_type(conversation_type)
         cur.execute(
             """
-            SELECT id FROM chat_session
+            SELECT id, conversation_type FROM chat_session
             WHERE hermes_session_id = %s AND user_id = %s
             LIMIT 1
             """,
@@ -169,18 +220,51 @@ class ChatMySQLStore:
         )
         row = cur.fetchone()
         if row:
+            stored = normalize_conversation_type(row.get("conversation_type"))
+            if stored != conv_type:
+                raise ConversationTypeMismatchError()
             return int(row["id"])
 
         session_uid = uuid.uuid4().hex
         cur.execute(
             """
             INSERT INTO chat_session (
-                session_uid, hermes_session_id, user_id, tenant_id, channel, status
-            ) VALUES (%s, %s, %s, %s, %s, 1)
+                session_uid, hermes_session_id, user_id, tenant_id, channel,
+                conversation_type, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, 1)
             """,
-            (session_uid, hermes_session_id, user_id, tenant_id, channel),
+            (session_uid, hermes_session_id, user_id, tenant_id, channel, conv_type),
         )
         return int(cur.lastrowid)
+
+    def check_session_conversation_type(
+        self,
+        *,
+        user_id: str,
+        hermes_session_id: str,
+        conversation_type: int,
+    ) -> None:
+        """Raise ConversationTypeMismatchError if an existing session type differs."""
+        conv_type = normalize_conversation_type(conversation_type)
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT conversation_type FROM chat_session
+                    WHERE hermes_session_id = %s AND user_id = %s
+                    LIMIT 1
+                    """,
+                    (hermes_session_id, user_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return
+                stored = normalize_conversation_type(row.get("conversation_type"))
+                if stored != conv_type:
+                    raise ConversationTypeMismatchError()
+        finally:
+            conn.close()
 
     def _next_turn_no(self, cur, session_id: int) -> int:
         cur.execute(
@@ -209,6 +293,7 @@ class ChatMySQLStore:
         fulfillment_status: Optional[str] = None,
         fulfillment_reason: Optional[str] = None,
         is_final: Optional[bool] = None,
+        conversation_type: int = CONVERSATION_TYPE_HISTORY,
     ) -> Dict[str, int]:
         usage = usage or {}
         prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
@@ -229,6 +314,7 @@ class ChatMySQLStore:
             is_final_db = 1 if is_final else 0
 
         hermes_response_ref = response_id or completion_id
+        conv_type = normalize_conversation_type(conversation_type)
 
         conn = self._connect()
         try:
@@ -239,6 +325,7 @@ class ChatMySQLStore:
                     hermes_session_id=hermes_session_id,
                     channel=channel,
                     tenant_id=tenant_id,
+                    conversation_type=conv_type,
                 )
                 turn_no = self._next_turn_no(cur, session_id)
 
@@ -247,9 +334,9 @@ class ChatMySQLStore:
                     """
                     INSERT INTO chat_message (
                         message_uid, session_id, user_id, tenant_id, turn_no, role,
-                        content, model, prompt_tokens, completion_tokens, total_tokens,
-                        hermes_response_id, hermes_run_id
-                    ) VALUES (%s, %s, %s, %s, %s, 'user', %s, %s, 0, 0, 0, %s, %s)
+                        conversation_type, content, model, prompt_tokens, completion_tokens,
+                        total_tokens, hermes_response_id, hermes_run_id
+                    ) VALUES (%s, %s, %s, %s, %s, 'user', %s, %s, %s, 0, 0, 0, %s, %s)
                     """,
                     (
                         q_uid,
@@ -257,6 +344,7 @@ class ChatMySQLStore:
                         user_id,
                         tenant_id,
                         turn_no,
+                        conv_type,
                         question_text,
                         model,
                         hermes_response_ref,
@@ -272,9 +360,9 @@ class ChatMySQLStore:
                         """
                         INSERT INTO chat_message (
                             message_uid, session_id, user_id, tenant_id, turn_no, role,
-                            content, model, prompt_tokens, completion_tokens, total_tokens,
-                            hermes_response_id, hermes_run_id
-                        ) VALUES (%s, %s, %s, %s, %s, 'assistant', %s, %s, %s, %s, %s, %s, %s)
+                            conversation_type, content, model, prompt_tokens,
+                            completion_tokens, total_tokens, hermes_response_id, hermes_run_id
+                        ) VALUES (%s, %s, %s, %s, %s, 'assistant', %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             a_uid,
@@ -282,6 +370,7 @@ class ChatMySQLStore:
                             user_id,
                             tenant_id,
                             turn_no,
+                            conv_type,
                             answer_text,
                             model,
                             prompt_tokens,
@@ -445,23 +534,27 @@ class ChatMySQLStore:
         *,
         limit: int = 20,
         page: int = 1,
+        conversation_types: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         """List chat sessions for a user, newest activity first."""
         limit = max(1, min(int(limit), 100))
         page = max(1, int(page))
         offset = (page - 1) * limit
+        types = conversation_types or list(DEFAULT_HISTORY_SESSION_CONVERSATION_TYPES)
+        types = [normalize_conversation_type(t) for t in types]
+        placeholders = ", ".join(["%s"] * len(types))
 
         conn = self._connect()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) AS n FROM chat_session WHERE user_id = %s",
-                    (user_id,),
-                )
+                count_sql = f"""
+                    SELECT COUNT(*) AS n FROM chat_session
+                    WHERE user_id = %s AND conversation_type IN ({placeholders})
+                """
+                cur.execute(count_sql, (user_id, *types))
                 total = int((cur.fetchone() or {}).get("n", 0))
 
-                cur.execute(
-                    """
+                list_sql = f"""
                     SELECT
                         s.id,
                         s.session_uid,
@@ -469,6 +562,7 @@ class ChatMySQLStore:
                         s.user_id,
                         s.tenant_id,
                         s.channel,
+                        s.conversation_type,
                         s.title,
                         s.status,
                         s.started_at,
@@ -488,12 +582,11 @@ class ChatMySQLStore:
                             LIMIT 1
                         ) AS last_question
                     FROM chat_session s
-                    WHERE s.user_id = %s
+                    WHERE s.user_id = %s AND s.conversation_type IN ({placeholders})
                     ORDER BY s.updated_at DESC, s.id DESC
                     LIMIT %s OFFSET %s
-                    """,
-                    (user_id, limit, offset),
-                )
+                """
+                cur.execute(list_sql, (user_id, *types, limit, offset))
                 sessions = _rows_to_dicts(list(cur.fetchall()))
         finally:
             conn.close()
@@ -504,6 +597,7 @@ class ChatMySQLStore:
             "total": total,
             "limit": limit,
             "page": page,
+            "conversation_types": types,
             "sessions": sessions,
         }
 

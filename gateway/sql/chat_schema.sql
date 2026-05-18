@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS chat_session (
   user_id VARCHAR(64) NOT NULL COMMENT '业务用户ID',
   tenant_id VARCHAR(64) DEFAULT NULL,
   channel VARCHAR(32) DEFAULT 'api_server',
+  conversation_type TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '1=history 2=favorite 3=direct',
   title VARCHAR(255) DEFAULT NULL,
   status TINYINT NOT NULL DEFAULT 1 COMMENT '1-active 2-closed 3-archived',
   started_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -18,7 +19,8 @@ CREATE TABLE IF NOT EXISTS chat_session (
   PRIMARY KEY (id),
   UNIQUE KEY uk_session_uid (session_uid),
   KEY idx_hermes_session_user (hermes_session_id, user_id),
-  KEY idx_user_started (user_id, started_at DESC)
+  KEY idx_user_started (user_id, started_at DESC),
+  KEY idx_user_conv_updated (user_id, conversation_type, updated_at DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS chat_message (
@@ -29,6 +31,7 @@ CREATE TABLE IF NOT EXISTS chat_message (
   tenant_id VARCHAR(64) DEFAULT NULL,
   turn_no INT UNSIGNED NOT NULL,
   role ENUM('system','user','assistant','tool') NOT NULL,
+  conversation_type TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '1=history 2=favorite 3=direct',
   content LONGTEXT NOT NULL,
   content_type VARCHAR(32) DEFAULT 'text',
   provider VARCHAR(64) DEFAULT NULL,
