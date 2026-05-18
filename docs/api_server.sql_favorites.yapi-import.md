@@ -31,6 +31,52 @@
    - **全局 Header**：`Authorization: Bearer <API_SERVER_KEY>`
 5. 收藏接口 POST 建议再配：`X-Hermes-User-Id: <业务用户ID>`（与 body.user_id 二选一）
 
+## 基于收藏继续对话（conversation_type=2）
+
+在 `POST /v1/chat/completions` 或 `POST /v1/responses` 的 **JSON body** 中携带：
+
+| 字段 | 说明 |
+|------|------|
+| `conversation_type` | `1` 历史（默认）、`2` 收藏、`3` 直查 SQL |
+| `favorite_id` | `conversation_type=2` 时必填，`favorite_uid` 或数字 id |
+| `sql` | `conversation_type=3` 时填写要执行的 SQL（也可在消息里粘贴 SQL） |
+| `user_id` | 可选，与 Header `X-Hermes-User-Id` 二选一，用于收藏归属校验 |
+
+- **类型 1（历史）**：默认，与现有 `X-Hermes-Session-Id` 续聊行为一致。
+- **类型 2（收藏）**：按 `favorite_id` 查询关联 SQL 与摘要，注入本次对话的系统上下文。
+- **类型 3（直查）**：须在 body 的 `sql` 字段或用户消息中提供 SQL；未提供时**不调用 Agent**，直接返回引导话术请用户补充 SQL。
+
+```http
+POST /v1/chat/completions
+Authorization: Bearer <API_SERVER_KEY>
+X-Hermes-User-Id: user-001
+Content-Type: application/json
+
+{
+  "model": "hermes-agent",
+  "conversation_type": 2,
+  "favorite_id": "a1b2c3d4e5f6...",
+  "messages": [{"role": "user", "content": "在刚才 SQL 基础上按部门再拆一版"}]
+}
+```
+
+### 直查 SQL（conversation_type=3）
+
+```http
+POST /v1/chat/completions
+Authorization: Bearer <API_SERVER_KEY>
+Content-Type: application/json
+
+{
+  "model": "hermes-agent",
+  "conversation_type": 3,
+  "sql": "SELECT id, name FROM users LIMIT 10",
+  "messages": [{"role": "user", "content": "帮我执行并解读结果"}]
+}
+```
+
+未带 `sql` 且消息也不像 SQL 时，响应 `hermes.direct_sql_required: true`，内容为引导用户补充 SQL。
+
 ## 调用示例
 
 ### 1. 创建收藏

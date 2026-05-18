@@ -1203,6 +1203,22 @@
         },
         "tool_choice": {
           "type": "object"
+        },
+        "conversation_type": {
+          "type": "integer",
+          "description": "1=history (default), 2=favorite, 3=direct SQL"
+        },
+        "favorite_id": {
+          "type": "string",
+          "description": "Required when conversation_type=2; favorite_uid or numeric id"
+        },
+        "sql": {
+          "type": "string",
+          "description": "Required for direct mode (type 3) unless user message contains SQL"
+        },
+        "user_id": {
+          "type": "string",
+          "description": "Business user id for favorite ownership check (optional if X-Hermes-User-Id header set)"
         }
       }
     },
@@ -1293,6 +1309,22 @@
           "enum": [
             "auto"
           ]
+        },
+        "conversation_type": {
+          "type": "integer",
+          "description": "1=history (default), 2=favorite, 3=direct SQL"
+        },
+        "favorite_id": {
+          "type": "string",
+          "description": "Required when conversation_type=2; favorite_uid or numeric id"
+        },
+        "sql": {
+          "type": "string",
+          "description": "Required for direct mode (type 3) unless input contains SQL"
+        },
+        "user_id": {
+          "type": "string",
+          "description": "Business user id for favorite ownership check"
         }
       }
     },

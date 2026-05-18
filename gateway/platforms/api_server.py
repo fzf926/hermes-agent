@@ -59,6 +59,10 @@ from gateway.sql_execution import (
     sql_results_display_for_api,
 )
 from gateway.tool_call_log import capture_tool_call_record
+from gateway.chat_conversation_context import (
+    merge_ephemeral_system_prompt,
+    resolve_conversation_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -827,6 +831,239 @@ class APIServerAdapter(BasePlatformAdapter):
             return raw[:64]
         return None
 
+    def _resolve_conversation_mode(
+        self,
+        request: "web.Request",
+        body: Dict[str, Any],
+        base_prompt: Optional[str],
+        *,
+        user_message_text: str = "",
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> tuple[Optional[str], Optional["web.Response"], Optional[str]]:
+        """Apply conversation_type; return (merged_prompt, error, early_reply)."""
+        result = resolve_conversation_context(
+            request,
+            body,
+            user_message_text=user_message_text,
+            conversation_history=conversation_history,
+            mysql_store=self._get_chat_mysql_store(),
+            openai_error_factory=_openai_error,
+        )
+        if result.error_response is not None:
+            return None, result.error_response, None
+        if result.early_reply:
+            return None, None, result.early_reply
+        return merge_ephemeral_system_prompt(base_prompt, result.extra_prompt), None, None
+
+    async def _return_prompt_only_chat_completion(
+        self,
+        request: "web.Request",
+        *,
+        body: Dict[str, Any],
+        completion_id: str,
+        model_name: str,
+        created: int,
+        session_id: str,
+        gateway_session_key: Optional[str],
+        reply_text: str,
+        user_id: Optional[str],
+        user_message_text: str,
+        stream: bool,
+    ) -> "web.Response":
+        """Return a guided reply without running the agent (direct SQL missing)."""
+        response_headers = {"X-Hermes-Session-Id": session_id}
+        if gateway_session_key:
+            response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        response_headers["X-Hermes-Conversation-Type"] = "3"
+        response_headers["X-Hermes-Direct-Sql-Required"] = "true"
+
+        if stream:
+            sse_headers = {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                **response_headers,
+            }
+            origin = request.headers.get("Origin", "")
+            cors = self._cors_headers_for_origin(origin) if origin else None
+            if cors:
+                sse_headers.update(cors)
+            response = web.StreamResponse(status=200, headers=sse_headers)
+            await response.prepare(request)
+            role_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+            await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+            content_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": reply_text}, "finish_reason": None}],
+            }
+            await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+            stop_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            await response.write(f"data: {json.dumps(stop_chunk)}\n\n".encode())
+            await response.write(b"data: [DONE]\n\n")
+            await response.write_eof()
+            return response
+
+        response_data = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": reply_text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "hermes": {
+                "conversation_type": 3,
+                "direct_sql_required": True,
+            },
+        }
+        if user_id:
+            await self._persist_chat_to_mysql(
+                user_id=user_id,
+                hermes_session_id=session_id,
+                question_text=user_message_text,
+                answer_text=reply_text,
+                model=model_name,
+                usage=response_data["usage"],
+                completion_id=completion_id,
+                status="answered",
+            )
+        return web.json_response(response_data, headers=response_headers)
+
+    async def _return_prompt_only_response(
+        self,
+        request: "web.Request",
+        *,
+        body: Dict[str, Any],
+        reply_text: str,
+        user_message_text: str,
+        session_id: str,
+        gateway_session_key: Optional[str],
+        user_id: Optional[str],
+        stream: bool,
+    ) -> "web.Response":
+        """Responses API: guided reply when direct SQL is missing."""
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        created_at = int(time.time())
+        model_name = body.get("model", self._model_name)
+        response_headers = {"X-Hermes-Session-Id": session_id}
+        if gateway_session_key:
+            response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        response_headers["X-Hermes-Conversation-Type"] = "3"
+        response_headers["X-Hermes-Direct-Sql-Required"] = "true"
+
+        if stream:
+            import queue as _q
+
+            stream_q: _q.Queue = _q.Queue()
+            stream_q.put(None)
+            agent_task = asyncio.ensure_future(self._fake_prompt_agent_result(reply_text))
+
+            async def _persist_direct_sql_prompt() -> None:
+                if user_id:
+                    await self._persist_chat_to_mysql(
+                        user_id=user_id,
+                        hermes_session_id=session_id,
+                        question_text=user_message_text,
+                        answer_text=reply_text,
+                        model=model_name,
+                        usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                        response_id=response_id,
+                        status="answered",
+                    )
+
+            persist_task = asyncio.create_task(_persist_direct_sql_prompt())
+            try:
+                return await self._write_sse_responses(
+                    request=request,
+                    response_id=response_id,
+                    model=model_name,
+                    created_at=created_at,
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=[None],
+                    conversation_history=[],
+                    user_message=user_message_text,
+                    instructions=None,
+                    conversation=None,
+                    store=False,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                    mysql_user_id=user_id,
+                    mysql_question_text=user_message_text,
+                    sql_records=[],
+                    tool_call_records=[],
+                )
+            finally:
+                if not persist_task.done():
+                    persist_task.cancel()
+
+        output_items = [
+            {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": reply_text}],
+            }
+        ]
+        response_data = {
+            "id": response_id,
+            "object": "response",
+            "status": "completed",
+            "created_at": created_at,
+            "model": model_name,
+            "output": output_items,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "hermes": {
+                "conversation_type": 3,
+                "direct_sql_required": True,
+            },
+        }
+        if user_id:
+            await self._persist_chat_to_mysql(
+                user_id=user_id,
+                hermes_session_id=session_id,
+                question_text=user_message_text,
+                answer_text=reply_text,
+                model=model_name,
+                usage=response_data["usage"],
+                response_id=response_id,
+                status="answered",
+            )
+        return web.json_response(response_data, headers=response_headers)
+
+    @staticmethod
+    async def _fake_prompt_agent_result(reply_text: str) -> tuple:
+        """Minimal agent result for guided replies (no LLM run)."""
+        return (
+            {
+                "final_response": reply_text,
+                "completed": True,
+                "failed": False,
+                "partial": False,
+            },
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+
     @staticmethod
     def _content_to_storage_text(content: Any) -> str:
         """Flatten message content for MySQL storage."""
@@ -1473,6 +1710,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 "approval_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
+                "conversation_type_body_field": "conversation_type",
+                "favorite_id_body_field": "favorite_id",
+                "conversation_types": {
+                    "history": 1,
+                    "favorite": 2,
+                    "direct": 3,
+                },
+                "conversation_type_direct_implemented": True,
+                "direct_sql_body_field": "sql",
                 "mysql_chat_history": True,
                 "cors": bool(self._cors_origins),
             },
@@ -1567,6 +1813,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        user_message_text = self._content_to_storage_text(user_message)
+
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
         # is independent of X-Hermes-Session-Id: the key persists across
@@ -1625,9 +1873,35 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        system_prompt, conv_err, conv_early_reply = self._resolve_conversation_mode(
+            request,
+            body,
+            system_prompt,
+            user_message_text=user_message_text,
+            conversation_history=history,
+        )
+        if conv_err is not None:
+            return conv_err
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+
+        if conv_early_reply:
+            return await self._return_prompt_only_chat_completion(
+                request,
+                body=body,
+                completion_id=completion_id,
+                model_name=model_name,
+                created=created,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                reply_text=conv_early_reply,
+                user_id=user_id,
+                user_message_text=user_message_text,
+                stream=stream,
+            )
+
         sql_records: List[Dict[str, Any]] = []
         tool_call_records: List[Dict[str, Any]] = []
         tool_call_started_at: Dict[str, float] = {}
@@ -2863,18 +3137,41 @@ class APIServerAdapter(BasePlatformAdapter):
         if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
+        user_message_text = self._content_to_storage_text(user_message)
+
+        instructions, conv_err, conv_early_reply = self._resolve_conversation_mode(
+            request,
+            body,
+            instructions,
+            user_message_text=user_message_text,
+            conversation_history=conversation_history,
+        )
+        if conv_err is not None:
+            return conv_err
+
+        session_id = stored_session_id or str(uuid.uuid4())
+        stream = bool(body.get("stream", False))
+
+        if conv_early_reply:
+            return await self._return_prompt_only_response(
+                request,
+                body=body,
+                reply_text=conv_early_reply,
+                user_message_text=user_message_text,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                user_id=user_id,
+                stream=stream,
+            )
+
         # Truncation support
         if body.get("truncation") == "auto" and len(conversation_history) > 100:
             conversation_history = conversation_history[-100:]
 
-        # Reuse session from previous_response_id chain so the dashboard
-        # groups the entire conversation under one session entry.
-        session_id = stored_session_id or str(uuid.uuid4())
         sql_records: List[Dict[str, Any]] = []
         tool_call_records: List[Dict[str, Any]] = []
         tool_call_started_at: Dict[str, float] = {}
 
-        stream = bool(body.get("stream", False))
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -3692,10 +3989,61 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        user_message_text = user_message if isinstance(user_message, str) else str(user_message)
+
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
         approval_session_key = gateway_session_key or session_id or run_id
-        ephemeral_system_prompt = instructions
+        ephemeral_system_prompt, conv_err, conv_early_reply = self._resolve_conversation_mode(
+            request,
+            body,
+            instructions,
+            user_message_text=user_message_text,
+            conversation_history=conversation_history,
+        )
+        if conv_err is not None:
+            return conv_err
+
+        if conv_early_reply:
+            loop = asyncio.get_running_loop()
+            q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+            created_at = time.time()
+            self._run_streams[run_id] = q
+            self._run_streams_created[run_id] = created_at
+            self._run_approval_sessions[run_id] = approval_session_key
+            self._set_run_status(
+                run_id,
+                "completed",
+                created_at=created_at,
+                session_id=session_id,
+                model=body.get("model", self._model_name),
+                last_event="message.completed",
+            )
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "message.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": conv_early_reply,
+                })
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "run.completed",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "status": "completed",
+                })
+            except Exception:
+                pass
+            return web.json_response(
+                {
+                    "run_id": run_id,
+                    "status": "completed",
+                    "hermes": {"conversation_type": 3, "direct_sql_required": True},
+                },
+                status=202,
+                headers={"X-Hermes-Direct-Sql-Required": "true"},
+            )
+
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
