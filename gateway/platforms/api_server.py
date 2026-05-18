@@ -62,9 +62,11 @@ from gateway.tool_call_log import capture_tool_call_record
 from gateway.chat_conversation_context import (
     merge_ephemeral_system_prompt,
     parse_conversation_type,
+    parse_favorite_id,
     resolve_conversation_context,
 )
 from gateway.chat_mysql_store import (
+    CONVERSATION_TYPE_FAVORITE,
     ConversationTypeMismatchError,
     parse_conversation_types_filter,
 )
@@ -910,6 +912,7 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message_text: str,
         stream: bool,
         conversation_type: int = 3,
+        favorite_id: Optional[str] = None,
     ) -> "web.Response":
         """Return a guided reply without running the agent (direct SQL missing)."""
         response_headers = {"X-Hermes-Session-Id": session_id}
@@ -988,6 +991,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 completion_id=completion_id,
                 status="answered",
                 conversation_type=conversation_type,
+                favorite_id=favorite_id,
             )
         return web.json_response(response_data, headers=response_headers)
 
@@ -1003,6 +1007,7 @@ class APIServerAdapter(BasePlatformAdapter):
         user_id: Optional[str],
         stream: bool,
         conversation_type: int = 3,
+        favorite_id: Optional[str] = None,
     ) -> "web.Response":
         """Responses API: guided reply when direct SQL is missing."""
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
@@ -1033,6 +1038,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         response_id=response_id,
                         status="answered",
                         conversation_type=conversation_type,
+                        favorite_id=favorite_id,
                     )
 
             persist_task = asyncio.create_task(_persist_direct_sql_prompt())
@@ -1093,6 +1099,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 response_id=response_id,
                 status="answered",
                 conversation_type=conversation_type,
+                favorite_id=favorite_id,
             )
         return web.json_response(response_data, headers=response_headers)
 
@@ -1137,6 +1144,7 @@ class APIServerAdapter(BasePlatformAdapter):
         fulfillment_reason: Optional[str] = None,
         is_final: Optional[bool] = None,
         conversation_type: int = 1,
+        favorite_id: Optional[str] = None,
     ) -> None:
         store = self._get_chat_mysql_store()
         if not store:
@@ -1186,6 +1194,20 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             await loop.run_in_executor(None, _run)
+            if (
+                conversation_type == CONVERSATION_TYPE_FAVORITE
+                and favorite_id
+                and hermes_session_id
+            ):
+
+                def _update_followup():
+                    store.update_favorite_followup_session(
+                        favorite_ref=favorite_id,
+                        user_id=user_id,
+                        hermes_session_id=hermes_session_id,
+                    )
+
+                await loop.run_in_executor(None, _update_followup)
             logger.info(
                 "MySQL chat persisted user_id=%s session=%s status=%s sql_count=%s",
                 user_id,
@@ -1481,6 +1503,51 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Failed to list SQL favorites for user %s: %s", user_id, exc, exc_info=True)
             return web.json_response(
                 _openai_error(f"Failed to list favorites: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_get_sql_favorite(self, request: "web.Request") -> "web.Response":
+        """GET /api/chat/favorites/{favorite_id} — favorite detail with SQL rows."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        mysql_err = self._check_mysql_chat_available()
+        if mysql_err:
+            return mysql_err
+
+        favorite_ref, id_err = self._sanitize_path_id(
+            request.match_info.get("favorite_id", ""), name="favorite_id"
+        )
+        if id_err:
+            return id_err
+
+        user_id = self._parse_user_id(request, None)
+        store = self._get_chat_mysql_store()
+
+        try:
+            result = await self._run_mysql_chat_query(
+                lambda: store.get_sql_favorite_detail(favorite_ref, user_id=user_id or "")
+            )
+            if not result.get("ok"):
+                status = int(result.get("http_status") or 404)
+                return web.json_response(
+                    _openai_error(str(result.get("error") or "Favorite not found")),
+                    status=status,
+                )
+            return web.json_response(
+                {
+                    "object": "chat.sql_favorite",
+                    "favorite": result.get("favorite"),
+                    "total": result.get("total", 0),
+                    "sql": result.get("sql", []),
+                }
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to get SQL favorite detail %s: %s", favorite_ref, exc, exc_info=True
+            )
+            return web.json_response(
+                _openai_error(f"Failed to get favorite: {exc}", err_type="server_error"),
                 status=500,
             )
 
@@ -1806,6 +1873,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "method": "GET",
                     "path": "/api/chat/users/{user_id}/favorites",
                 },
+                "chat_favorite_detail": {
+                    "method": "GET",
+                    "path": "/api/chat/favorites/{favorite_id}",
+                },
                 "chat_favorite_sql": {
                     "method": "GET",
                     "path": "/api/chat/favorites/{favorite_id}/sql",
@@ -1946,6 +2017,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return conv_err
 
         conversation_type = parse_conversation_type(body)
+        favorite_id = parse_favorite_id(body) if conversation_type == CONVERSATION_TYPE_FAVORITE else None
         if user_id:
             type_err = await self._assert_mysql_session_conversation_type(
                 user_id=user_id,
@@ -1973,6 +2045,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_message_text=user_message_text,
                 stream=stream,
                 conversation_type=conversation_type,
+                favorite_id=favorite_id,
             )
 
         sql_records: List[Dict[str, Any]] = []
@@ -2090,6 +2163,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 mysql_user_id=user_id,
                 mysql_question_text=self._content_to_storage_text(user_message),
                 mysql_conversation_type=conversation_type,
+                mysql_favorite_id=favorite_id,
                 sql_records=sql_records,
                 tool_call_records=tool_call_records,
             )
@@ -2261,6 +2335,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 fulfillment_reason=fulfillment.get("fulfillment_reason"),
                 is_final=fulfillment.get("is_final"),
                 conversation_type=conversation_type,
+                favorite_id=favorite_id,
             )
 
         return web.json_response(response_data, headers=response_headers)
@@ -2272,6 +2347,7 @@ class APIServerAdapter(BasePlatformAdapter):
         mysql_user_id: Optional[str] = None,
         mysql_question_text: Optional[str] = None,
         mysql_conversation_type: int = 1,
+        mysql_favorite_id: Optional[str] = None,
         sql_records: Optional[List[Dict[str, Any]]] = None,
         tool_call_records: Optional[List[Dict[str, Any]]] = None,
     ) -> "web.StreamResponse":
@@ -2417,6 +2493,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         fulfillment_reason=fulfillment.get("fulfillment_reason"),
                         is_final=fulfillment.get("is_final"),
                         conversation_type=mysql_conversation_type,
+                        favorite_id=mysql_favorite_id,
                     )
 
             # Finish chunk
@@ -2490,6 +2567,7 @@ class APIServerAdapter(BasePlatformAdapter):
         mysql_user_id: Optional[str] = None,
         mysql_question_text: Optional[str] = None,
         mysql_conversation_type: int = 1,
+        mysql_favorite_id: Optional[str] = None,
         sql_records: Optional[List[Dict[str, Any]]] = None,
         tool_call_records: Optional[List[Dict[str, Any]]] = None,
     ) -> "web.StreamResponse":
@@ -3051,6 +3129,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     fulfillment_reason=stream_fulfillment.get("fulfillment_reason"),
                     is_final=stream_fulfillment.get("is_final"),
                     conversation_type=mysql_conversation_type,
+                    favorite_id=mysql_favorite_id,
                 )
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -3229,6 +3308,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return conv_err
 
         conversation_type = parse_conversation_type(body)
+        favorite_id = parse_favorite_id(body) if conversation_type == CONVERSATION_TYPE_FAVORITE else None
         session_id = stored_session_id or str(uuid.uuid4())
         if user_id:
             type_err = await self._assert_mysql_session_conversation_type(
@@ -3252,6 +3332,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_id=user_id,
                 stream=stream,
                 conversation_type=conversation_type,
+                favorite_id=favorite_id,
             )
 
         # Truncation support
@@ -3359,6 +3440,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 mysql_user_id=user_id,
                 mysql_question_text=self._content_to_storage_text(user_message),
                 mysql_conversation_type=conversation_type,
+                mysql_favorite_id=favorite_id,
                 sql_records=sql_records,
                 tool_call_records=tool_call_records,
             )
@@ -3509,6 +3591,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 fulfillment_reason=fulfillment.get("fulfillment_reason"),
                 is_final=fulfillment.get("is_final"),
                 conversation_type=conversation_type,
+                favorite_id=favorite_id,
             )
 
         return web.json_response(response_data, headers=response_headers)
@@ -4634,6 +4717,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get(
                 "/api/chat/users/{user_id}/favorites",
                 self._handle_list_user_sql_favorites,
+            )
+            self._app.router.add_get(
+                "/api/chat/favorites/{favorite_id}",
+                self._handle_get_sql_favorite,
             )
             self._app.router.add_get(
                 "/api/chat/favorites/{favorite_id}/sql",

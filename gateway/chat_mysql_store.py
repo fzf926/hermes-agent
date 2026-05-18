@@ -834,6 +834,7 @@ class ChatMySQLStore:
             "turn_id": row.get("turn_id"),
             "turn_no": row.get("turn_no"),
             "hermes_response_id": row.get("hermes_response_id"),
+            "followup_hermes_session_id": row.get("followup_hermes_session_id"),
             "question_summary": row.get("question_summary"),
             "answer_summary": row.get("answer_summary"),
             "fulfillment_status": row.get("fulfillment_status"),
@@ -1086,6 +1087,56 @@ class ChatMySQLStore:
             "limit": limit,
             "page": page,
             "favorites": favorites,
+        }
+
+    def update_favorite_followup_session(
+        self,
+        *,
+        favorite_ref: str,
+        user_id: str,
+        hermes_session_id: str,
+    ) -> None:
+        """Persist the latest Hermes session id used for favorite follow-up chat."""
+        fav_ref = (favorite_ref or "").strip()
+        uid = (user_id or "").strip()
+        sid = (hermes_session_id or "").strip()
+        if not fav_ref or not uid or not sid:
+            return
+
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                favorite = self._resolve_favorite(cur, fav_ref)
+                if not favorite:
+                    return
+                fav_user = str(favorite.get("user_id") or "").strip()
+                if fav_user and fav_user != uid:
+                    return
+                cur.execute(
+                    """
+                    UPDATE chat_sql_favorite
+                    SET followup_hermes_session_id = %s, updated_at = CURRENT_TIMESTAMP(3)
+                    WHERE id = %s AND status = 1
+                    """,
+                    (sid, int(favorite["id"])),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_sql_favorite_detail(self, favorite_ref: str, *, user_id: str) -> Dict[str, Any]:
+        """Return favorite metadata plus linked SQL rows (including sql_content)."""
+        result = self.list_sql_favorite_sql(favorite_ref, user_id=user_id)
+        if not result.get("ok"):
+            return result
+        return {
+            "ok": True,
+            "favorite": result.get("favorite"),
+            "sql": result.get("sql", []),
+            "total": result.get("total", 0),
         }
 
     def list_sql_favorite_sql(self, favorite_ref: str, *, user_id: str) -> Dict[str, Any]:

@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS chat_sql_favorite (
   turn_id BIGINT UNSIGNED NOT NULL,
   turn_no INT UNSIGNED NOT NULL,
   hermes_response_id VARCHAR(128) NOT NULL COMMENT 'Assistant response id from chat_message',
+  followup_hermes_session_id VARCHAR(128) DEFAULT NULL COMMENT 'Latest session for favorite follow-up chat',
   question_summary VARCHAR(512) DEFAULT NULL COMMENT 'AI summary of user question',
   answer_summary VARCHAR(512) DEFAULT NULL COMMENT 'AI summary of assistant answer',
   fulfillment_status VARCHAR(32) DEFAULT NULL,
@@ -139,6 +140,7 @@ CREATE TABLE IF NOT EXISTS chat_sql_favorite (
   PRIMARY KEY (id),
   UNIQUE KEY uk_favorite_uid (favorite_uid),
   UNIQUE KEY uk_user_response (user_id, hermes_response_id),
+  KEY idx_user_followup_session (user_id, followup_hermes_session_id),
   KEY idx_user_created (user_id, created_at DESC),
   CONSTRAINT fk_fav_session FOREIGN KEY (session_id) REFERENCES chat_session(id),
   CONSTRAINT fk_fav_turn FOREIGN KEY (turn_id) REFERENCES chat_turn(id)

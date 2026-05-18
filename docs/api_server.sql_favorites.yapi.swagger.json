@@ -2,7 +2,7 @@
   "swagger": "2.0",
   "info": {
     "title": "Hermes SQL Favorites API",
-    "description": "SQL 收藏接口（独立 Swagger，仅含 3 个接口）。收藏 satisfied 轮次的 chat_sql_execution；Q&A 仅存 AI 摘要。来源: gateway/platforms/api_server.py + gateway/chat_mysql_store.py",
+    "description": "SQL 收藏接口。收藏 satisfied 轮次的 chat_sql_execution；Q&A 仅存 AI 摘要。conversation_type=2 续聊后会更新 followup_hermes_session_id。来源: gateway/platforms/api_server.py + gateway/chat_mysql_store.py",
     "version": "1.0.0"
   },
   "host": "127.0.0.1:8642",
@@ -114,11 +114,65 @@
         }
       }
     },
+    "/api/chat/favorites/{favorite_id}": {
+      "get": {
+        "tags": ["sql_favorites"],
+        "summary": "查询收藏详情（含 SQL 正文）",
+        "description": "favorite_id 支持内部数字 id 或 favorite_uid。返回收藏摘要及关联的全部 chat_sql_execution（含 sql_content）。可选 Header X-Hermes-User-Id 做归属校验。",
+        "security": [{"BearerAuth": []}],
+        "parameters": [
+          {
+            "name": "favorite_id",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "description": "收藏 id（数字）或 favorite_uid"
+          },
+          {
+            "name": "X-Hermes-User-Id",
+            "in": "header",
+            "required": false,
+            "type": "string",
+            "description": "传入时校验收藏是否属于该用户"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "收藏详情",
+            "schema": {"$ref": "#/definitions/ChatFavoriteDetailResponse"},
+            "examples": {
+              "application/json": {
+                "object": "chat.sql_favorite",
+                "favorite": {
+                  "id": 1,
+                  "favorite_uid": "a1b2c3d4e5f6789012345678901234567",
+                  "followup_hermes_session_id": "sess_followup_xyz",
+                  "sql_count": 1
+                },
+                "total": 1,
+                "sql": [
+                  {
+                    "sql_content": "SELECT channel, COUNT(*) AS cnt FROM orders WHERE dt = '2026-05-16' GROUP BY channel",
+                    "database": "analytics",
+                    "instance": "prod-mysql-01",
+                    "status": "success"
+                  }
+                ]
+              }
+            }
+          },
+          "401": {"description": "未授权", "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}},
+          "403": {"description": "收藏不属于该用户", "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}},
+          "404": {"description": "收藏不存在", "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}},
+          "503": {"description": "MySQL 未启用或不可用", "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}}
+        }
+      }
+    },
     "/api/chat/users/{user_id}/favorites": {
       "get": {
         "tags": ["sql_favorites"],
         "summary": "查询用户收藏列表",
-        "description": "按 created_at 倒序分页返回收藏摘要（含 question_summary / answer_summary、sql_count，不含 SQL 正文）。",
+        "description": "按 created_at 倒序分页返回收藏摘要（含 question_summary / answer_summary、sql_count、followup_hermes_session_id；不含 SQL 正文，详情见 GET /api/chat/favorites/{favorite_id}）。",
         "security": [{"BearerAuth": []}],
         "parameters": [
           {
@@ -169,6 +223,7 @@
                     "answer_summary": "返回按渠道汇总的订单数与金额",
                     "fulfillment_status": "satisfied",
                     "sql_count": 2,
+                    "followup_hermes_session_id": "sess_followup_xyz",
                     "created_at": "2026-05-17T10:30:00"
                   }
                 ]
@@ -297,6 +352,10 @@
         "turn_id": {"type": "integer", "format": "int64"},
         "turn_no": {"type": "integer"},
         "hermes_response_id": {"type": "string"},
+        "followup_hermes_session_id": {
+          "type": "string",
+          "description": "基于该收藏续聊时最近一次使用的 Hermes session_id；续聊请带 X-Hermes-Session-Id"
+        },
         "question_summary": {
           "type": "string",
           "description": "用户问题的 AI 摘要（非原文）"
@@ -358,6 +417,18 @@
       "type": "object",
       "properties": {
         "object": {"type": "string", "example": "list"},
+        "favorite": {"$ref": "#/definitions/ChatSqlFavoriteSummary"},
+        "total": {"type": "integer"},
+        "sql": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/ChatSqlExecutionItem"}
+        }
+      }
+    },
+    "ChatFavoriteDetailResponse": {
+      "type": "object",
+      "properties": {
+        "object": {"type": "string", "example": "chat.sql_favorite"},
         "favorite": {"$ref": "#/definitions/ChatSqlFavoriteSummary"},
         "total": {"type": "integer"},
         "sql": {
