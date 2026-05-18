@@ -1088,6 +1088,148 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    async def _handle_create_sql_favorite(self, request: "web.Request") -> "web.Response":
+        """POST /api/chat/favorites — favorite SQL from a satisfied turn."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        mysql_err = self._check_mysql_chat_available()
+        if mysql_err:
+            return mysql_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+
+        hermes_response_id = str(body.get("hermes_response_id") or "").strip()
+        if not hermes_response_id:
+            return web.json_response(
+                _openai_error("Missing hermes_response_id", err_type="invalid_request_error"),
+                status=400,
+            )
+
+        user_id = self._parse_user_id(request, body)
+        if not user_id:
+            return web.json_response(
+                _openai_error(
+                    "user_id is required (set X-Hermes-User-Id header or body.user_id)",
+                    err_type="invalid_request_error",
+                ),
+                status=400,
+            )
+
+        store = self._get_chat_mysql_store()
+        try:
+            result = await self._run_mysql_chat_query(
+                lambda: store.create_sql_favorite(
+                    user_id=user_id,
+                    hermes_response_id=hermes_response_id,
+                )
+            )
+            if not result.get("ok"):
+                status = int(result.get("http_status") or 400)
+                return web.json_response(
+                    _openai_error(str(result.get("error") or "Failed to create favorite")),
+                    status=status,
+                )
+            return web.json_response(
+                {
+                    "object": "chat.sql_favorite",
+                    "created": bool(result.get("created")),
+                    "favorite": result.get("favorite"),
+                },
+                status=201 if result.get("created") else 200,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to create SQL favorite for user %s response %s: %s",
+                user_id,
+                hermes_response_id,
+                exc,
+                exc_info=True,
+            )
+            return web.json_response(
+                _openai_error(f"Failed to create favorite: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_list_user_sql_favorites(self, request: "web.Request") -> "web.Response":
+        """GET /api/chat/users/{user_id}/favorites — list SQL favorites for a user."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        mysql_err = self._check_mysql_chat_available()
+        if mysql_err:
+            return mysql_err
+
+        user_id, id_err = self._sanitize_path_id(request.match_info.get("user_id", ""), name="user_id")
+        if id_err:
+            return id_err
+
+        limit, page = self._parse_pagination(request)
+        store = self._get_chat_mysql_store()
+
+        try:
+            result = await self._run_mysql_chat_query(
+                lambda: store.list_sql_favorites_by_user(user_id, limit=limit, page=page)
+            )
+            return web.json_response(result)
+        except Exception as exc:
+            logger.warning("Failed to list SQL favorites for user %s: %s", user_id, exc, exc_info=True)
+            return web.json_response(
+                _openai_error(f"Failed to list favorites: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+    async def _handle_list_favorite_sql(self, request: "web.Request") -> "web.Response":
+        """GET /api/chat/favorites/{favorite_id}/sql — SQL rows for one favorite."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        mysql_err = self._check_mysql_chat_available()
+        if mysql_err:
+            return mysql_err
+
+        favorite_ref, id_err = self._sanitize_path_id(
+            request.match_info.get("favorite_id", ""), name="favorite_id"
+        )
+        if id_err:
+            return id_err
+
+        user_id = self._parse_user_id(request, None)
+        store = self._get_chat_mysql_store()
+
+        try:
+            result = await self._run_mysql_chat_query(
+                lambda: store.list_sql_favorite_sql(favorite_ref, user_id=user_id or "")
+            )
+            if not result.get("ok"):
+                status = int(result.get("http_status") or 404)
+                return web.json_response(
+                    _openai_error(str(result.get("error") or "Favorite not found")),
+                    status=status,
+                )
+            return web.json_response(
+                {
+                    "object": "list",
+                    "favorite": result.get("favorite"),
+                    "total": result.get("total", 0),
+                    "sql": result.get("sql", []),
+                }
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to list SQL for favorite %s: %s", favorite_ref, exc, exc_info=True
+            )
+            return web.json_response(
+                _openai_error(f"Failed to list favorite SQL: {exc}", err_type="server_error"),
+                status=500,
+            )
+
     # ------------------------------------------------------------------
     # Session header helpers
     # ------------------------------------------------------------------
@@ -1347,6 +1489,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_session_turns": {
                     "method": "GET",
                     "path": "/api/chat/sessions/{session_id}/turns",
+                },
+                "chat_create_sql_favorite": {
+                    "method": "POST",
+                    "path": "/api/chat/favorites",
+                },
+                "chat_user_sql_favorites": {
+                    "method": "GET",
+                    "path": "/api/chat/users/{user_id}/favorites",
+                },
+                "chat_favorite_sql": {
+                    "method": "GET",
+                    "path": "/api/chat/favorites/{favorite_id}/sql",
                 },
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
@@ -4021,6 +4175,18 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get(
                 "/api/chat/sessions/{session_id}/turns",
                 self._handle_list_session_chat_turns,
+            )
+            self._app.router.add_post(
+                "/api/chat/favorites",
+                self._handle_create_sql_favorite,
+            )
+            self._app.router.add_get(
+                "/api/chat/users/{user_id}/favorites",
+                self._handle_list_user_sql_favorites,
+            )
+            self._app.router.add_get(
+                "/api/chat/favorites/{favorite_id}/sql",
+                self._handle_list_favorite_sql,
             )
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)

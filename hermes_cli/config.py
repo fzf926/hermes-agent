@@ -887,6 +887,14 @@ DEFAULT_CONFIG = {
             "timeout": 45,
             "extra_body": {},
         },
+        "favorite_summarizer": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
@@ -925,6 +933,10 @@ DEFAULT_CONFIG = {
         "database": "hermes_agent",
         # After each API chat turn, auxiliary LLM judges intent fulfillment.
         "fulfillment_judge_enabled": True,
+        # When favoriting a satisfied turn, one LLM call summarizes Q&A for the list UI.
+        "favorite_summarizer_enabled": True,
+        # Turns of session history (including bookmarked turn) passed into the summarizer.
+        "favorite_summarizer_history_turns": 5,
     },
 
     "display": {

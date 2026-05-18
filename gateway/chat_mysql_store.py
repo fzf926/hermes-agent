@@ -21,6 +21,10 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from gateway.favorite_summarizer import (
+    get_favorite_summarizer_history_turns,
+    summarize_favorite_turn,
+)
 from gateway.fulfillment_judge import conversation_for_api
 from gateway.sql_execution import sql_records_for_turn_api
 from gateway.tool_call_log import json_dumps_for_mysql, tool_call_rows_for_turn_api
@@ -640,4 +644,400 @@ class ChatMySQLStore:
             "session": session,
             "total": len(turns),
             "turns": turns,
+        }
+
+    def _resolve_favorite(self, cur, favorite_ref: str) -> Optional[Dict[str, Any]]:
+        ref = (favorite_ref or "").strip()
+        if not ref:
+            return None
+        if ref.isdigit():
+            cur.execute(
+                """
+                SELECT f.*, s.hermes_session_id, s.session_uid
+                FROM chat_sql_favorite f
+                JOIN chat_session s ON s.id = f.session_id
+                WHERE f.id = %s AND f.status = 1
+                LIMIT 1
+                """,
+                (int(ref),),
+            )
+            row = cur.fetchone()
+            if row:
+                return _row_to_dict(row)
+        cur.execute(
+            """
+            SELECT f.*, s.hermes_session_id, s.session_uid
+            FROM chat_sql_favorite f
+            JOIN chat_session s ON s.id = f.session_id
+            WHERE f.favorite_uid = %s AND f.status = 1
+            LIMIT 1
+            """,
+            (ref,),
+        )
+        return _row_to_dict(cur.fetchone())
+
+    def get_turn_context_for_favorite_summary(
+        self,
+        cur,
+        *,
+        session_id: int,
+        turn_id: int,
+        turn_no: int,
+        history_turns: int = 5,
+    ) -> Dict[str, Any]:
+        """Load up to N turns of Q&A ending at turn_no, plus SQL on the bookmarked turn."""
+        window = max(1, min(int(history_turns), 10))
+        min_turn = max(1, int(turn_no) - window + 1)
+        cur.execute(
+            """
+            SELECT turn_no, question_text, answer_text
+            FROM chat_turn
+            WHERE session_id = %s AND turn_no >= %s AND turn_no <= %s
+            ORDER BY turn_no ASC
+            """,
+            (session_id, min_turn, turn_no),
+        )
+        history = []
+        for row in cur.fetchall():
+            history.append(
+                {
+                    "turn_no": int(row["turn_no"]),
+                    "question_text": str(row.get("question_text") or ""),
+                    "answer_text": str(row.get("answer_text") or ""),
+                    "is_current": int(row["turn_no"]) == int(turn_no),
+                }
+            )
+
+        cur.execute(
+            """
+            SELECT sql_content, db_name, instance_name, status
+            FROM chat_sql_execution
+            WHERE turn_id = %s
+            ORDER BY id ASC
+            LIMIT 20
+            """,
+            (turn_id,),
+        )
+        sql_rows = [
+            {
+                "sql_content": str(r.get("sql_content") or ""),
+                "database": str(r.get("db_name") or ""),
+                "instance": str(r.get("instance_name") or ""),
+                "status": str(r.get("status") or ""),
+            }
+            for r in cur.fetchall()
+        ]
+        return {"history_turns": history, "sql_executions": sql_rows}
+
+    def _favorite_summary(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": row.get("id"),
+            "favorite_uid": row.get("favorite_uid"),
+            "user_id": row.get("user_id"),
+            "session_id": row.get("session_id"),
+            "session_uid": row.get("session_uid"),
+            "hermes_session_id": row.get("hermes_session_id"),
+            "turn_id": row.get("turn_id"),
+            "turn_no": row.get("turn_no"),
+            "hermes_response_id": row.get("hermes_response_id"),
+            "question_summary": row.get("question_summary"),
+            "answer_summary": row.get("answer_summary"),
+            "fulfillment_status": row.get("fulfillment_status"),
+            "fulfillment_reason": row.get("fulfillment_reason"),
+            "sql_count": row.get("sql_count", 0),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
+
+    def create_sql_favorite(
+        self,
+        *,
+        user_id: str,
+        hermes_response_id: str,
+    ) -> Dict[str, Any]:
+        """Favorite SQL from a satisfied turn identified by hermes_response_id."""
+        uid = (user_id or "").strip()
+        resp_id = (hermes_response_id or "").strip()
+        if not uid:
+            return {"ok": False, "http_status": 400, "error": "user_id is required"}
+        if not resp_id:
+            return {"ok": False, "http_status": 400, "error": "hermes_response_id is required"}
+
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, session_id, turn_no, user_id, role
+                    FROM chat_message
+                    WHERE hermes_response_id = %s
+                    ORDER BY FIELD(role, 'assistant', 'user'), id DESC
+                    LIMIT 1
+                    """,
+                    (resp_id,),
+                )
+                msg = cur.fetchone()
+                if not msg:
+                    return {
+                        "ok": False,
+                        "http_status": 404,
+                        "error": f"Message not found for hermes_response_id: {resp_id}",
+                    }
+
+                msg_user = str(msg.get("user_id") or "").strip()
+                if msg_user and msg_user != uid:
+                    return {
+                        "ok": False,
+                        "http_status": 403,
+                        "error": "hermes_response_id does not belong to this user",
+                    }
+
+                session_id = int(msg["session_id"])
+                turn_no = int(msg["turn_no"])
+
+                cur.execute(
+                    """
+                    SELECT
+                        id, session_id, user_id, turn_no,
+                        question_text, answer_text,
+                        fulfillment_status, fulfillment_reason, is_final
+                    FROM chat_turn
+                    WHERE session_id = %s AND turn_no = %s
+                    LIMIT 1
+                    """,
+                    (session_id, turn_no),
+                )
+                turn = cur.fetchone()
+                if not turn:
+                    return {
+                        "ok": False,
+                        "http_status": 404,
+                        "error": "Chat turn not found for this response",
+                    }
+
+                turn_user = str(turn.get("user_id") or "").strip()
+                if turn_user and turn_user != uid:
+                    return {
+                        "ok": False,
+                        "http_status": 403,
+                        "error": "Turn does not belong to this user",
+                    }
+
+                fulfillment = (turn.get("fulfillment_status") or "").strip().lower()
+                if fulfillment != "satisfied":
+                    return {
+                        "ok": False,
+                        "http_status": 400,
+                        "error": (
+                            "Only turns with fulfillment_status=satisfied can be favorited "
+                            f"(current: {fulfillment or 'unknown'})"
+                        ),
+                    }
+
+                turn_id = int(turn["id"])
+
+                cur.execute(
+                    """
+                    SELECT f.*, s.hermes_session_id, s.session_uid,
+                           (SELECT COUNT(*) FROM chat_sql_favorite_item i
+                            WHERE i.favorite_id = f.id) AS sql_count
+                    FROM chat_sql_favorite f
+                    JOIN chat_session s ON s.id = f.session_id
+                    WHERE f.user_id = %s AND f.hermes_response_id = %s AND f.status = 1
+                    LIMIT 1
+                    """,
+                    (uid, resp_id),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    conn.commit()
+                    fav = _row_to_dict(existing)
+                    return {
+                        "ok": True,
+                        "created": False,
+                        "favorite": self._favorite_summary(fav),
+                    }
+
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM chat_sql_execution
+                    WHERE turn_id = %s
+                    ORDER BY id ASC
+                    """,
+                    (turn_id,),
+                )
+                sql_rows = list(cur.fetchall())
+                if not sql_rows:
+                    return {
+                        "ok": False,
+                        "http_status": 400,
+                        "error": "No SQL executions found for this turn",
+                    }
+
+                ctx = self.get_turn_context_for_favorite_summary(
+                    cur,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    turn_no=turn_no,
+                    history_turns=get_favorite_summarizer_history_turns(),
+                )
+                summaries = summarize_favorite_turn(
+                    question_text=str(turn.get("question_text") or ""),
+                    answer_text=str(turn.get("answer_text") or ""),
+                    history_turns=ctx.get("history_turns"),
+                    sql_executions=ctx.get("sql_executions"),
+                )
+
+                favorite_uid = uuid.uuid4().hex
+                cur.execute(
+                    """
+                    INSERT INTO chat_sql_favorite (
+                        favorite_uid, user_id, session_id, turn_id, turn_no,
+                        hermes_response_id, question_summary, answer_summary,
+                        fulfillment_status, fulfillment_reason, status
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                    """,
+                    (
+                        favorite_uid,
+                        uid,
+                        session_id,
+                        turn_id,
+                        turn_no,
+                        resp_id,
+                        summaries.get("question_summary"),
+                        summaries.get("answer_summary"),
+                        turn.get("fulfillment_status"),
+                        turn.get("fulfillment_reason"),
+                    ),
+                )
+                favorite_id = int(cur.lastrowid)
+
+                for idx, sql_row in enumerate(sql_rows):
+                    cur.execute(
+                        """
+                        INSERT INTO chat_sql_favorite_item (
+                            favorite_id, sql_execution_id, sort_order
+                        ) VALUES (%s, %s, %s)
+                        """,
+                        (favorite_id, int(sql_row["id"]), idx),
+                    )
+
+                cur.execute(
+                    """
+                    SELECT f.*, s.hermes_session_id, s.session_uid,
+                           %s AS sql_count
+                    FROM chat_sql_favorite f
+                    JOIN chat_session s ON s.id = f.session_id
+                    WHERE f.id = %s
+                    LIMIT 1
+                    """,
+                    (len(sql_rows), favorite_id),
+                )
+                created = _row_to_dict(cur.fetchone())
+            conn.commit()
+            return {
+                "ok": True,
+                "created": True,
+                "favorite": self._favorite_summary(created),
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_sql_favorites_by_user(
+        self,
+        user_id: str,
+        *,
+        limit: int = 20,
+        page: int = 1,
+    ) -> Dict[str, Any]:
+        """List active SQL favorites for a user."""
+        uid = (user_id or "").strip()
+        offset = (max(1, page) - 1) * limit
+
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM chat_sql_favorite WHERE user_id = %s AND status = 1",
+                    (uid,),
+                )
+                total = int((cur.fetchone() or {}).get("n") or 0)
+
+                cur.execute(
+                    """
+                    SELECT f.*, s.hermes_session_id, s.session_uid,
+                           (SELECT COUNT(*) FROM chat_sql_favorite_item i
+                            WHERE i.favorite_id = f.id) AS sql_count
+                    FROM chat_sql_favorite f
+                    JOIN chat_session s ON s.id = f.session_id
+                    WHERE f.user_id = %s AND f.status = 1
+                    ORDER BY f.created_at DESC, f.id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (uid, limit, offset),
+                )
+                rows = _rows_to_dicts(list(cur.fetchall()))
+        finally:
+            conn.close()
+
+        favorites = [self._favorite_summary(row) for row in rows]
+        return {
+            "object": "list",
+            "user_id": uid,
+            "total": total,
+            "limit": limit,
+            "page": page,
+            "favorites": favorites,
+        }
+
+    def list_sql_favorite_sql(self, favorite_ref: str, *, user_id: str) -> Dict[str, Any]:
+        """Return SQL execution details linked to a favorite."""
+        uid = (user_id or "").strip()
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                favorite = self._resolve_favorite(cur, favorite_ref)
+                if not favorite:
+                    return {
+                        "ok": False,
+                        "http_status": 404,
+                        "error": f"Favorite not found: {favorite_ref}",
+                    }
+
+                fav_user = str(favorite.get("user_id") or "").strip()
+                if fav_user and uid and fav_user != uid:
+                    return {
+                        "ok": False,
+                        "http_status": 403,
+                        "error": "Favorite does not belong to this user",
+                    }
+
+                favorite_id = int(favorite["id"])
+                cur.execute(
+                    """
+                    SELECT
+                        e.id, e.turn_id, e.tool_call_id, e.sql_content, e.db_name,
+                        e.instance_name, e.status, e.error_message,
+                        e.query_time_ms, e.row_count, e.created_at,
+                        i.sort_order
+                    FROM chat_sql_favorite_item i
+                    JOIN chat_sql_execution e ON e.id = i.sql_execution_id
+                    WHERE i.favorite_id = %s
+                    ORDER BY i.sort_order ASC, i.id ASC
+                    """,
+                    (favorite_id,),
+                )
+                sql_rows = _rows_to_dicts(list(cur.fetchall()))
+        finally:
+            conn.close()
+
+        return {
+            "ok": True,
+            "favorite": self._favorite_summary(favorite),
+            "sql": sql_records_for_turn_api(sql_rows),
+            "total": len(sql_rows),
         }
