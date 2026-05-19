@@ -923,6 +923,19 @@ DEFAULT_CONFIG = {
         },
     },
     
+    # DBOps online query execution. Safe default: generate audited SQL only.
+    "dbops": {
+        "execute_enabled": False,
+        "excel_threshold_min": 21,
+        "excel_threshold_max": 5000,
+        "export_threshold": 5001,
+        "pagination_page_size": 1000,
+        "export_poll_interval_sec": 2.0,
+        "export_poll_timeout_sec": 180.0,
+        "exports_dir": "",
+        "public_base_url": "",
+    },
+
     # API server chat history persistence (MySQL). Env vars HERMES_MYSQL_* override.
     "mysql_chat": {
         "enabled": False,

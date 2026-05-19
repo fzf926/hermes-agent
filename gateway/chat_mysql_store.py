@@ -26,7 +26,7 @@ from gateway.favorite_summarizer import (
     summarize_favorite_turn,
 )
 from gateway.fulfillment_judge import conversation_for_api
-from gateway.sql_execution import sql_records_for_turn_api
+from gateway.sql_execution import sql_records_for_turn_api, turn_sql_payload_for_api
 from gateway.tool_call_log import json_dumps_for_mysql, tool_call_rows_for_turn_api
 
 logger = logging.getLogger(__name__)
@@ -450,13 +450,24 @@ class ChatMySQLStore:
                     err_msg = rec.get("error_message")
                     query_time_ms = rec.get("query_time_ms")
                     row_count = rec.get("row_count")
+                    total_row_count = rec.get("total_row_count")
+                    delivery_mode = rec.get("delivery_mode")
+                    download_url = rec.get("download_url")
+                    generation_reason = rec.get("generation_reason")
+                    export_uid = rec.get("export_uid")
+                    dbops_export_task_id = rec.get("dbops_export_task_id")
+                    user_display = rec.get("user_display")
+                    result_table = rec.get("result_table")
                     cur.execute(
                         """
                         INSERT INTO chat_sql_execution (
                             session_id, turn_id, user_id, tool_call_id,
                             sql_content, db_name, instance_name, status,
-                            error_message, query_time_ms, row_count
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            error_message, query_time_ms, row_count,
+                            total_row_count, delivery_mode, download_url,
+                            generation_reason, export_uid, dbops_export_task_id,
+                            user_display, result_table
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             session_id,
@@ -470,6 +481,14 @@ class ChatMySQLStore:
                             (str(err_msg)[:512] if err_msg else None),
                             query_time_ms,
                             int(row_count) if row_count is not None else None,
+                            int(total_row_count) if total_row_count is not None else None,
+                            (str(delivery_mode)[:32] if delivery_mode else None),
+                            (str(download_url)[:2048] if download_url else None),
+                            (str(generation_reason) if generation_reason else None),
+                            (str(export_uid)[:64] if export_uid else None),
+                            (str(dbops_export_task_id)[:64] if dbops_export_task_id else None),
+                            (str(user_display) if user_display else None),
+                            (str(result_table) if result_table else None),
                         ),
                     )
             conn.commit()
@@ -601,6 +620,44 @@ class ChatMySQLStore:
             "sessions": sessions,
         }
 
+    def get_sql_export_record(
+        self,
+        export_uid: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up a Hermes-local Excel export by export_uid (optional user scope)."""
+        uid = (export_uid or "").strip()
+        if not uid:
+            return None
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                if user_id:
+                    cur.execute(
+                        """
+                        SELECT id, user_id, export_uid, delivery_mode, download_url
+                        FROM chat_sql_execution
+                        WHERE export_uid = %s AND user_id = %s
+                        LIMIT 1
+                        """,
+                        (uid, user_id.strip()),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, user_id, export_uid, delivery_mode, download_url
+                        FROM chat_sql_execution
+                        WHERE export_uid = %s
+                        LIMIT 1
+                        """,
+                        (uid,),
+                    )
+                row = cur.fetchone()
+                return _row_to_dict(row) if row else None
+        finally:
+            conn.close()
+
     def resolve_session(self, session_ref: str) -> Optional[Dict[str, Any]]:
         """Resolve a session by internal id, session_uid, or hermes_session_id."""
         ref = (session_ref or "").strip()
@@ -683,7 +740,9 @@ class ChatMySQLStore:
                         """
                         SELECT
                             id, turn_id, tool_call_id, sql_content, db_name, instance_name,
-                            status, error_message, query_time_ms, row_count, created_at
+                            status, error_message, query_time_ms, row_count, total_row_count,
+                            delivery_mode, download_url, generation_reason, export_uid,
+                            dbops_export_task_id, user_display, result_table, created_at
                         FROM chat_sql_execution
                         WHERE session_id = %s
                         ORDER BY turn_id ASC, id ASC
@@ -716,9 +775,11 @@ class ChatMySQLStore:
                 for turn in turns:
                     tid = turn.get("id")
                     rows = sql_by_turn.get(int(tid), []) if tid is not None else []
-                    turn["sql"] = sql_records_for_turn_api(rows)
                     tool_rows = (
                         tool_calls_by_turn.get(int(tid), []) if tid is not None else []
+                    )
+                    turn.update(
+                        turn_sql_payload_for_api(rows, tool_call_rows=tool_rows)
                     )
                     turn["tool_calls"] = tool_call_rows_for_turn_api(tool_rows)
                     if turn.get("fulfillment_status"):
@@ -1167,7 +1228,10 @@ class ChatMySQLStore:
                     SELECT
                         e.id, e.turn_id, e.tool_call_id, e.sql_content, e.db_name,
                         e.instance_name, e.status, e.error_message,
-                        e.query_time_ms, e.row_count, e.created_at,
+                        e.query_time_ms, e.row_count, e.total_row_count,
+                        e.delivery_mode, e.download_url, e.generation_reason,
+                        e.export_uid, e.dbops_export_task_id,
+                        e.user_display, e.result_table, e.created_at,
                         i.sort_order
                     FROM chat_sql_favorite_item i
                     JOIN chat_sql_execution e ON e.id = i.sql_execution_id

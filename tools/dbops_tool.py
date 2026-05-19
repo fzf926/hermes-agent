@@ -5,36 +5,20 @@ from __future__ import annotations
 
 import json
 import logging
-import gzip
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 from hermes_constants import display_hermes_home, get_hermes_home
-from tools.dbops_result_formatter import (
-    align_rows_to_columns,
-    format_dbops_user_display,
-    format_markdown_table,
-)
-
-DBOPS_META_MARKER = "\n__DBOPS_META__\n"
-from tools.registry import registry, tool_error, tool_result
+from tools.dbops_config import is_dbops_execute_enabled, load_dbops_yaml_config
+from tools.dbops_delivery import DBOPS_META_MARKER, execute_with_volume_routing
+from tools.dbops_models import DBOpsQueryInput, DBOpsResolvedQuery, normalize_limit as _normalize_limit
+from tools.registry import registry, tool_error
 from tools.sql_audit import SqlAuditor
 
 logger = logging.getLogger(__name__)
 
 _sql_auditor = SqlAuditor()
 
-_DBOPS_AGENT_INSTRUCTION = (
-    "向用户展示查询结果时：必须完整复制 user_display 中的「查询成功」摘要和同一张 Markdown 表格；"
-    "禁止把多行结果拆成「记录 1 / 记录 2」逐字段列举。"
-    "同轮多次 dbops_query 时，按每次调用的 user_display 分块展示，不要混在一张表里。"
-)
-
-DBOPS_QUERY_URL = "https://dbops.codemao.cn/query/"
 COOKIE_KEYS = (
     "csrftoken",
     "cluouser_name",
@@ -55,6 +39,9 @@ def get_dbops_db_config_path() -> Path:
     return _dbops_config_dir() / "dbops_db_config.json"
 
 
+_load_dbops_yaml_config = load_dbops_yaml_config
+
+
 def _ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -67,14 +54,6 @@ def _load_json_file(path: Path) -> Any:
     except Exception:
         logger.warning("Failed to parse JSON file: %s", path)
         return None
-
-
-def _normalize_limit(value: Any, default: int = 100) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = default
-    return min(max(parsed, 1), 1000)
 
 
 def _extract_cookie_map(raw_cookie: Any) -> dict[str, str]:
@@ -198,103 +177,43 @@ def _pick_db_config(db_key: str | None) -> dict[str, Any] | None:
     return configs[0]
 
 
-@dataclass
-class DBOpsQueryInput:
-    sql_content: str
-    db_key: str = ""
-    instance_name: str = ""
-    db_name: str = ""
-    schema_name: str = ""
-    tb_name: str = ""
-    limit_num: int = 100
+def resolve_dbops_query(query_input: DBOpsQueryInput) -> DBOpsResolvedQuery | str:
+    if not query_input.sql_content:
+        return "sql_content is required"
 
-    @classmethod
-    def from_args(cls, args: dict[str, Any]) -> "DBOpsQueryInput":
-        return cls(
-            sql_content=str(args.get("sql_content", "")).strip(),
-            db_key=str(args.get("db_key", "")).strip(),
-            instance_name=str(args.get("instance_name", "")).strip(),
-            db_name=str(args.get("db_name", "")).strip(),
-            schema_name=str(args.get("schema_name", "")).strip(),
-            tb_name=str(args.get("tb_name", "")).strip(),
-            limit_num=_normalize_limit(args.get("limit_num", 100)),
+    selected = _pick_db_config(query_input.db_key)
+    if query_input.db_key and selected is None:
+        return f"db_key not found in dbops_db_config.json: {query_input.db_key}"
+    if selected is None and not query_input.instance_name:
+        return (
+            "No database config found. Please create ~/.hermes/config/dbops_db_config.json "
+            "with a list of database entries, or pass instance_name/db_name in tool args."
         )
 
+    base = selected or {}
+    resolved_instance = query_input.instance_name or str(base.get("instance_name", "")).strip()
+    resolved_db = query_input.db_name or str(base.get("db_name", "")).strip()
+    resolved_schema = query_input.schema_name or str(base.get("schema_name", "")).strip()
+    resolved_table = query_input.tb_name or str(base.get("tb_name", "")).strip()
+    resolved_limit = _normalize_limit(
+        query_input.limit_num, _normalize_limit(base.get("limit_num", 100))
+    )
+    resolved_db_key = query_input.db_key or str(base.get("key", "")).strip()
 
-@dataclass
-class DBOpsResolvedQuery:
-    sql_content: str
-    db_key: str
-    instance_name: str
-    db_name: str
-    schema_name: str
-    tb_name: str
-    limit_num: int
+    if not resolved_instance:
+        return "instance_name is required (from db config or tool args)"
+    if not resolved_db:
+        return "db_name is required (from db config or tool args)"
 
-    @classmethod
-    def resolve(cls, query_input: DBOpsQueryInput) -> "DBOpsResolvedQuery | str":
-        if not query_input.sql_content:
-            return "sql_content is required"
-
-        selected = _pick_db_config(query_input.db_key)
-        if query_input.db_key and selected is None:
-            return f"db_key not found in dbops_db_config.json: {query_input.db_key}"
-        if selected is None and not query_input.instance_name:
-            return (
-                "No database config found. Please create ~/.hermes/config/dbops_db_config.json "
-                "with a list of database entries, or pass instance_name/db_name in tool args."
-            )
-
-        base = selected or {}
-        resolved_instance = query_input.instance_name or str(base.get("instance_name", "")).strip()
-        resolved_db = query_input.db_name or str(base.get("db_name", "")).strip()
-        resolved_schema = query_input.schema_name or str(base.get("schema_name", "")).strip()
-        resolved_table = query_input.tb_name or str(base.get("tb_name", "")).strip()
-        resolved_limit = _normalize_limit(
-            query_input.limit_num, _normalize_limit(base.get("limit_num", 100))
-        )
-        resolved_db_key = query_input.db_key or str(base.get("key", "")).strip()
-
-        if not resolved_instance:
-            return "instance_name is required (from db config or tool args)"
-        if not resolved_db:
-            return "db_name is required (from db config or tool args)"
-
-        return cls(
-            sql_content=query_input.sql_content,
-            db_key=resolved_db_key,
-            instance_name=resolved_instance,
-            db_name=resolved_db,
-            schema_name=resolved_schema,
-            tb_name=resolved_table,
-            limit_num=resolved_limit,
-        )
-
-
-def _format_records(columns: list[Any], rows: list[Any]) -> list[dict[str, Any]]:
-    if not columns or not rows:
-        return []
-    return [
-        {str(col): row[idx] if idx < len(row) else None for idx, col in enumerate(columns)}
-        for row in rows
-        if isinstance(row, list)
-    ]
-
-
-def _decode_http_body(raw_bytes: bytes, content_encoding: str) -> str:
-    """Decode HTTP body with transparent gzip support."""
-    body = raw_bytes or b""
-    encoding = (content_encoding or "").lower()
-    try:
-        if "gzip" in encoding:
-            body = gzip.decompress(body)
-        elif body.startswith(b"\x1f\x8b"):
-            # Some upstreams forget Content-Encoding, but payload is still gzipped.
-            body = gzip.decompress(body)
-    except Exception:
-        # Fall back to raw bytes decode so caller can inspect response_preview.
-        pass
-    return body.decode("utf-8", errors="replace")
+    return DBOpsResolvedQuery(
+        sql_content=query_input.sql_content,
+        db_key=resolved_db_key,
+        instance_name=resolved_instance,
+        db_name=resolved_db,
+        schema_name=resolved_schema,
+        tb_name=resolved_table,
+        limit_num=resolved_limit,
+    )
 
 
 def _build_dbops_schema_overrides() -> dict[str, Any]:
@@ -317,6 +236,11 @@ def _build_dbops_schema_overrides() -> dict[str, Any]:
             "Run SQL query by calling DBOps HTTP endpoint. Cookies are loaded from "
             f"{home}/config/dbops_cookie.json. Database candidates are loaded from "
             f"{config_path}; the model should choose the most suitable db_key. "
+            "Execution is disabled by default unless HERMES_DBOPS_EXECUTE_ENABLED=1 "
+            "or config.yaml dbops.execute_enabled=true; when disabled, this tool returns "
+            "audited SQL only and does not access the online database. "
+            "When execution is enabled: ≤20 rows inline table; ≥21 rows local Excel download; "
+            ">5000 rows DBOps async export. Pass generation_reason to explain SQL provenance. "
             "On success, copy ``user_display`` verbatim to the user (one summary line + one table with "
             "all rows). Never list rows as 记录1/记录2 field-by-field. See ``agent_instruction``."
         ),
@@ -356,6 +280,13 @@ def _build_dbops_schema_overrides() -> dict[str, Any]:
                     "description": "Query row limit, range 1-1000, default 100.",
                     "default": 100,
                 },
+                "generation_reason": {
+                    "type": "string",
+                    "description": (
+                        "说明本次 SQL 的生成依据（参考了哪些表/字段/业务规则/历史对话等），"
+                        "会展示给用户并写入执行记录。"
+                    ),
+                },
             },
             "required": ["sql_content"],
         },
@@ -369,9 +300,60 @@ def check_dbops_requirements() -> bool:
     return True
 
 
+def _format_generation_reason_block(generation_reason: str | None) -> str:
+    if not generation_reason or not str(generation_reason).strip():
+        return ""
+    return f"\n\n**生成依据：**\n{generation_reason.strip()}\n"
+
+
+def _format_dbops_sql_only_result(
+    resolved: DBOpsResolvedQuery,
+    *,
+    generation_reason: str | None = None,
+) -> str:
+    source = {
+        "db_key": resolved.db_key,
+        "instance_name": resolved.instance_name,
+        "db_name": resolved.db_name,
+        "schema_name": resolved.schema_name,
+        "tb_name": resolved.tb_name,
+        "limit_num": resolved.limit_num,
+    }
+    reason_block = _format_generation_reason_block(generation_reason)
+    message = (
+        "已生成 SQL，DBOps 执行开关关闭，未执行查询，未访问线上库。\n\n"
+        f"```sql\n{resolved.sql_content}\n```"
+        f"{reason_block}"
+    )
+    meta = {
+        "success": True,
+        "executed": False,
+        "delivery_mode": "sql_only",
+        "generation_reason": generation_reason,
+        "status": None,
+        "msg": "DBOps execution disabled",
+        "row_count": 0,
+        "column_count": 0,
+        "agent_instruction": (
+            "DBOps 执行开关关闭。本次只向用户展示生成的 SQL，"
+            "不要编造查询结果或声称已经访问数据库。"
+        ),
+        "query": {
+            "full_sql": resolved.sql_content,
+            "query_time": None,
+            "affected_rows": None,
+            "seconds_behind_master": None,
+        },
+        "warning": "DBOps execution disabled",
+        "error": None,
+        "source": source,
+    }
+    return message + DBOPS_META_MARKER + json.dumps(meta, ensure_ascii=False)
+
+
 def dbops_query_tool(args: dict[str, Any]) -> str:
     query_input = DBOpsQueryInput.from_args(args)
-    resolved = DBOpsResolvedQuery.resolve(query_input)
+    resolved = resolve_dbops_query(query_input)
     if isinstance(resolved, str):
         return tool_error(resolved)
 
@@ -398,28 +380,14 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
             query={"full_sql": resolved.sql_content},
         )
 
+    generation_reason = str(args.get("generation_reason", "")).strip() or None
+
+    if not is_dbops_execute_enabled():
+        return _format_dbops_sql_only_result(resolved, generation_reason=generation_reason)
+
     cookie_text = _load_dbops_cookie_text()
     if not cookie_text:
         return tool_error("dbops cookie is empty in ~/.hermes/config/dbops_cookie.json")
-
-    payload = {
-        "instance_name": resolved.instance_name,
-        "db_name": resolved.db_name,
-        "schema_name": resolved.schema_name,
-        "tb_name": resolved.tb_name,
-        "sql_content": resolved.sql_content,
-        "limit_num": str(resolved.limit_num),
-    }
-    body = urlencode(payload).encode("utf-8")
-    headers = {
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://dbops.codemao.cn",
-        "Referer": "https://dbops.codemao.cn/sqlquery/",
-        "Cookie": cookie_text,
-        "X-CSRFToken": _extract_csrf_token(cookie_text),
-    }
 
     _source = {
         "db_key": resolved.db_key,
@@ -431,114 +399,28 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
     }
     _query_meta = {"full_sql": resolved.sql_content}
 
-    request = Request(DBOPS_QUERY_URL, data=body, headers=headers, method="POST")
-    try:
-        with urlopen(request, timeout=30) as response:
-            raw_bytes = response.read()
-            raw_text = _decode_http_body(
-                raw_bytes=raw_bytes,
-                content_encoding=response.headers.get("Content-Encoding", ""),
-            )
-    except HTTPError as exc:
-        return tool_error(
-            f"DBOps HTTP error: {exc.code} {exc.reason}",
-            success=False,
-            source=_source,
-            query=_query_meta,
-        )
-    except URLError as exc:
-        return tool_error(
-            f"DBOps request failed: {exc.reason}",
-            success=False,
-            source=_source,
-            query=_query_meta,
-        )
-    except Exception as exc:
-        return tool_error(
-            f"DBOps request failed: {exc}",
-            success=False,
-            source=_source,
-            query=_query_meta,
-        )
-
-    try:
-        parsed = json.loads(raw_text)
-    except Exception:
-        return tool_error(
-            "DBOps returned non-JSON response",
-            success=False,
-            response_preview=raw_text[:500],
-            source=_source,
-            query=_query_meta,
-        )
-
-    status = parsed.get("status")
-    msg = parsed.get("msg")
-    data = parsed.get("data") or {}
-    if status != 0:
-        return tool_error(
-            f"DBOps query failed: {msg or 'unknown error'}",
-            success=False,
-            status=status,
-            data_error=data.get("error"),
-            warning=data.get("warning"),
-            source=_source,
-            query=_query_meta,
-        )
-
-    columns = data.get("column_list") if isinstance(data.get("column_list"), list) else []
-    raw_rows = data.get("rows") if isinstance(data.get("rows"), list) else []
-    rows = align_rows_to_columns(columns, raw_rows)
-    row_count = len(rows)
-    query_time = data.get("query_time")
-    try:
-        query_time_f = float(query_time) if query_time is not None else None
-    except (TypeError, ValueError):
-        query_time_f = None
-
-    result_table = format_markdown_table(columns, rows)
-    user_display = format_dbops_user_display(
-        sql_content=resolved.sql_content,
-        instance_name=resolved.instance_name,
-        db_name=resolved.db_name,
-        columns=columns,
-        rows=rows,
-        row_count=row_count,
-        query_time=query_time_f,
+    outcome = execute_with_volume_routing(
+        resolved,
+        cookie_text=cookie_text,
+        csrf_token=_extract_csrf_token(cookie_text),
+        generation_reason=generation_reason,
     )
-    # 工具返回值以 Markdown 表格为主，避免模型只读 JSON 时自行挑选少量字段展示。
-    meta = {
-        "success": True,
-        "status": status,
-        "msg": msg,
-        "row_count": row_count,
-        "column_count": len(columns),
-        "agent_instruction": _DBOPS_AGENT_INSTRUCTION,
-        "query": {
-            "full_sql": data.get("full_sql"),
-            "query_time": query_time,
-            "affected_rows": data.get("affected_rows"),
-            "seconds_behind_master": data.get("seconds_behind_master"),
-        },
-        "warning": data.get("warning"),
-        "error": data.get("error"),
-        "source": {
-            "db_key": resolved.db_key,
-            "instance_name": resolved.instance_name,
-            "db_name": resolved.db_name,
-            "schema_name": resolved.schema_name,
-            "tb_name": resolved.tb_name,
-            "limit_num": resolved.limit_num,
-        },
-    }
-    return user_display + DBOPS_META_MARKER + json.dumps(meta, ensure_ascii=False)
+    if isinstance(outcome, str):
+        return tool_error(
+            outcome,
+            success=False,
+            source=_source,
+            query=_query_meta,
+        )
+    return outcome.text
 
 
 DBOPS_QUERY_SCHEMA = {
     "name": "dbops_query",
     "description": (
-        "通过 DBOps 执行只读 SQL。成功后必须把 user_display（一行摘要 + 整张表）原样给用户，"
-        "禁止按「记录1/记录2」逐条写字段。"
+        "通过 DBOps 生成或执行只读 SQL。默认只生成已审核 SQL，不访问线上库；"
+        "仅当 HERMES_DBOPS_EXECUTE_ENABLED=1 或 dbops.execute_enabled=true 时执行查询。"
+        "成功后必须把 user_display（一行摘要 + 整张表）原样给用户，禁止按「记录1/记录2」逐条写字段。"
     ),
     "parameters": {
         "type": "object",

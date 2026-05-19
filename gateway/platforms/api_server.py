@@ -1373,6 +1373,48 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    async def _handle_download_sql_export(self, request: "web.Request") -> "web.Response":
+        """GET /api/chat/sql-exports/{export_uid}/download — download Hermes Excel export."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        export_uid = str(request.match_info.get("export_uid", "")).strip()
+        if not export_uid or not export_uid.isalnum():
+            return web.json_response(_openai_error("Invalid export_uid"), status=400)
+
+        user_id = str(request.query.get("user_id", "")).strip() or None
+        mysql_err = self._check_mysql_chat_available()
+        if mysql_err is None:
+            store = self._get_chat_mysql_store()
+            try:
+                record = await self._run_mysql_chat_query(
+                    lambda: store.get_sql_export_record(export_uid, user_id=user_id)
+                )
+            except Exception as exc:
+                logger.warning("Failed to resolve sql export %s: %s", export_uid, exc)
+                return web.json_response(
+                    _openai_error(f"Failed to resolve export: {exc}", err_type="server_error"),
+                    status=500,
+                )
+            if not record:
+                return web.json_response(_openai_error("Export not found"), status=404)
+            if str(record.get("delivery_mode") or "") != "excel":
+                return web.json_response(_openai_error("Export is not a local Excel file"), status=400)
+
+        from gateway.sql_export_service import export_download_filename, resolve_export_file_path
+
+        path = resolve_export_file_path(export_uid)
+        if not path:
+            return web.json_response(_openai_error("Export file not found on disk"), status=404)
+
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Disposition": f'attachment; filename="{export_download_filename(export_uid)}"',
+            },
+        )
+
     async def _handle_list_session_chat_turns(self, request: "web.Request") -> "web.Response":
         """GET /api/chat/sessions/{session_id}/turns — list Q&A turns for a session."""
         auth_err = self._check_auth(request)
@@ -4725,6 +4767,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get(
                 "/api/chat/favorites/{favorite_id}/sql",
                 self._handle_list_favorite_sql,
+            )
+            self._app.router.add_get(
+                "/api/chat/sql-exports/{export_uid}/download",
+                self._handle_download_sql_export,
             )
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)

@@ -345,6 +345,10 @@
           "type": "array",
           "items": {"$ref": "#/definitions/ChatSqlExecutionItem"}
         },
+        "sql_display": {
+          "type": "string",
+          "description": "Merged markdown for all SQL executions on this turn (same as /v1/responses)"
+        },
         "conversation": {"$ref": "#/definitions/ChatConversationFulfillment"}
       }
     },
@@ -372,6 +376,15 @@
         "error_message": {"type": "string"},
         "query_time_ms": {"type": "number"},
         "row_count": {"type": "integer"},
+        "total_row_count": {"type": "integer"},
+        "delivery_mode": {
+          "type": "string",
+          "enum": ["inline", "excel", "dbops_export", "sql_only"]
+        },
+        "download_url": {"type": "string"},
+        "generation_reason": {"type": "string"},
+        "export_uid": {"type": "string"},
+        "dbops_export_task_id": {"type": "string"},
         "result_table": {
           "type": "string",
           "description": "Markdown table: column headers + all rows merged"
