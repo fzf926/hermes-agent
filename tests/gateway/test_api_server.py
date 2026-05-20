@@ -1114,7 +1114,8 @@ class TestChatCompletionsEndpoint:
             assert data["choices"][0]["message"]["content"] == "Hello! How can I help you today?"
             assert data["choices"][0]["finish_reason"] == "stop"
             assert "usage" in data
-            assert "conversation" not in data
+            assert data["conversation"]["fulfillment_status"] == "unknown"
+            assert data["conversation"]["is_final"] is True
 
     @pytest.mark.asyncio
     async def test_chat_completions_do_not_run_fulfillment_judge(self, adapter):
@@ -1148,7 +1149,8 @@ class TestChatCompletionsEndpoint:
                     data = await resp.json()
 
         assert resp.status == 200
-        assert "conversation" not in data
+        assert data["conversation"]["fulfillment_status"] == "unknown"
+        assert data["conversation"]["is_final"] is True
         mock_judge.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1377,7 +1379,8 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
-            assert "conversation" not in data
+            assert data["conversation"]["fulfillment_status"] == "unknown"
+            assert data["conversation"]["is_final"] is True
 
     @pytest.mark.asyncio
     async def test_responses_do_not_run_fulfillment_judge(self, adapter):
@@ -1404,7 +1407,8 @@ class TestResponsesEndpoint:
                     data = await resp.json()
 
         assert resp.status == 200
-        assert "conversation" not in data
+        assert data["conversation"]["fulfillment_status"] == "unknown"
+        assert data["conversation"]["is_final"] is True
         mock_judge.assert_not_awaited()
 
     @pytest.mark.asyncio

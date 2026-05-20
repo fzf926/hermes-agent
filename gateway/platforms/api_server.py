@@ -961,6 +961,7 @@ class APIServerAdapter(BasePlatformAdapter):
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
         response_headers["X-Hermes-Conversation-Type"] = "3"
         response_headers["X-Hermes-Direct-Sql-Required"] = "true"
+        fulfillment = self._default_conversation_fulfillment("answered")
 
         if stream:
             sse_headers = {
@@ -998,6 +999,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model": model_name,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             }
+            self._attach_conversation(stop_chunk, fulfillment)
             await response.write(f"data: {json.dumps(stop_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
             await response.write_eof()
@@ -1021,6 +1023,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "direct_sql_required": True,
             },
         }
+        self._attach_conversation(response_data, fulfillment)
         if user_id:
             await self._persist_chat_to_mysql(
                 user_id=user_id,
@@ -1031,6 +1034,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 usage=response_data["usage"],
                 completion_id=completion_id,
                 status="answered",
+                fulfillment_status=fulfillment.get("fulfillment_status"),
+                fulfillment_reason=fulfillment.get("fulfillment_reason"),
+                is_final=fulfillment.get("is_final"),
                 conversation_type=conversation_type,
                 favorite_id=favorite_id,
             )
@@ -1061,6 +1067,7 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers["X-Hermes-Direct-Sql-Required"] = "true"
 
         if stream:
+            fulfillment = self._default_conversation_fulfillment("answered")
             import queue as _q
 
             stream_q: _q.Queue = _q.Queue()
@@ -1078,6 +1085,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                         response_id=response_id,
                         status="answered",
+                        fulfillment_status=fulfillment.get("fulfillment_status"),
+                        fulfillment_reason=fulfillment.get("fulfillment_reason"),
+                        is_final=fulfillment.get("is_final"),
                         conversation_type=conversation_type,
                         favorite_id=favorite_id,
                     )
@@ -1129,6 +1139,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "direct_sql_required": True,
             },
         }
+        fulfillment = self._default_conversation_fulfillment("answered")
+        self._attach_conversation(response_data, fulfillment)
         if user_id:
             await self._persist_chat_to_mysql(
                 user_id=user_id,
@@ -1139,6 +1151,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 usage=response_data["usage"],
                 response_id=response_id,
                 status="answered",
+                fulfillment_status=fulfillment.get("fulfillment_status"),
+                fulfillment_reason=fulfillment.get("fulfillment_reason"),
+                is_final=fulfillment.get("is_final"),
                 conversation_type=conversation_type,
                 favorite_id=favorite_id,
             )
@@ -1325,6 +1340,14 @@ class APIServerAdapter(BasePlatformAdapter):
         fulfillment: Dict[str, Any],
     ) -> None:
         payload["conversation"] = conversation_for_api(fulfillment)
+
+    def _default_conversation_fulfillment(self, turn_status: str = "answered") -> Dict[str, Any]:
+        """Keep the conversation API shape without running the deprecated LLM judge."""
+        return {
+            "fulfillment_status": "unknown",
+            "fulfillment_reason": "Fulfillment judge did not run.",
+            "is_final": turn_status == "answered",
+        }
 
     def _attach_sql_results(
         self,
@@ -2492,6 +2515,8 @@ class APIServerAdapter(BasePlatformAdapter):
             turn_status = "error"
         elif is_partial:
             turn_status = "interrupted"
+        fulfillment = self._default_conversation_fulfillment(turn_status)
+        self._attach_conversation(response_data, fulfillment)
         flow_step("post_agent", sql_count=len(sql_records), tool_count=len(tool_call_records))
 
         if user_id:
@@ -2507,6 +2532,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 error_message=err_msg,
                 sql_executions=sql_records or None,
                 tool_calls=tool_call_records or None,
+                fulfillment_status=fulfillment.get("fulfillment_status"),
+                fulfillment_reason=fulfillment.get("fulfillment_reason"),
+                is_final=fulfillment.get("is_final"),
                 conversation_type=conversation_type,
                 favorite_id=favorite_id,
             )
@@ -2645,6 +2673,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     sql_count=len(sql_records),
                     tool_count=len(tool_call_records),
                 )
+                fulfillment = self._default_conversation_fulfillment(turn_status)
                 effective_sid = (
                     (agent_result or {}).get("session_id") or session_id or ""
                 )
@@ -2661,6 +2690,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         error_message=err_msg,
                         sql_executions=sql_records or None,
                         tool_calls=tool_call_records or None,
+                        fulfillment_status=fulfillment.get("fulfillment_status"),
+                        fulfillment_reason=fulfillment.get("fulfillment_reason"),
+                        is_final=fulfillment.get("is_final"),
                         conversation_type=mysql_conversation_type,
                         favorite_id=mysql_favorite_id,
                     )
@@ -2677,6 +2709,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
             }
             self._attach_sql_results(finish_chunk, sql_records)
+            if fulfillment:
+                self._attach_conversation(finish_chunk, fulfillment)
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -3222,6 +3256,7 @@ class APIServerAdapter(BasePlatformAdapter):
             })
 
             stream_turn_status = "error" if agent_error else "answered"
+            fulfillment = self._default_conversation_fulfillment(stream_turn_status)
             if mysql_question_text:
                 flow_step("build_response_stream", response_id=response_id)
 
@@ -3234,6 +3269,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                self._attach_conversation(failed_env, fulfillment)
                 _failed_history = list(conversation_history)
                 _failed_history.append({"role": "user", "content": user_message})
                 if final_response_text or agent_error:
@@ -3259,6 +3295,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 }
                 self._attach_sql_results(completed_env, sql_records)
+                self._attach_conversation(completed_env, fulfillment)
                 full_history = self._build_response_conversation_history(
                     conversation_history,
                     user_message,
@@ -3295,6 +3332,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     error_message=agent_error,
                     sql_executions=sql_records or None,
                     tool_calls=tool_call_records or None,
+                    fulfillment_status=fulfillment.get("fulfillment_status"),
+                    fulfillment_reason=fulfillment.get("fulfillment_reason"),
+                    is_final=fulfillment.get("is_final"),
                     conversation_type=mysql_conversation_type,
                     favorite_id=mysql_favorite_id,
                 )
@@ -3788,6 +3828,8 @@ class APIServerAdapter(BasePlatformAdapter):
         resp_turn_status = "answered"
         if result.get("error"):
             resp_turn_status = "error"
+        fulfillment = self._default_conversation_fulfillment(resp_turn_status)
+        self._attach_conversation(response_data, fulfillment)
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -3823,6 +3865,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 error_message=result.get("error"),
                 sql_executions=sql_records or None,
                 tool_calls=tool_call_records or None,
+                fulfillment_status=fulfillment.get("fulfillment_status"),
+                fulfillment_reason=fulfillment.get("fulfillment_reason"),
+                is_final=fulfillment.get("is_final"),
                 conversation_type=conversation_type,
                 favorite_id=favorite_id,
             )
