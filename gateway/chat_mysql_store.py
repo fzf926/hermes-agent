@@ -738,26 +738,28 @@ class ChatMySQLStore:
                 cur.execute(
                     """
                     SELECT
-                        id,
-                        session_id,
-                        user_id,
-                        tenant_id,
-                        turn_no,
-                        question_message_id,
-                        answer_message_id,
-                        question_text,
-                        answer_text,
-                        status,
-                        error_code,
-                        error_message,
-                        fulfillment_status,
-                        fulfillment_reason,
-                        is_final,
-                        feedback_score,
-                        created_at
-                    FROM chat_turn
-                    WHERE session_id = %s
-                    ORDER BY turn_no ASC, id ASC
+                        ct.id,
+                        ct.session_id,
+                        ct.user_id,
+                        ct.tenant_id,
+                        ct.turn_no,
+                        ct.question_message_id,
+                        ct.answer_message_id,
+                        ct.question_text,
+                        ct.answer_text,
+                        ct.status,
+                        ct.error_code,
+                        ct.error_message,
+                        ct.fulfillment_status,
+                        ct.fulfillment_reason,
+                        ct.is_final,
+                        ct.feedback_score,
+                        am.hermes_response_id AS hermes_response_id,
+                        ct.created_at
+                    FROM chat_turn ct
+                    LEFT JOIN chat_message am ON am.id = ct.answer_message_id
+                    WHERE ct.session_id = %s
+                    ORDER BY ct.turn_no ASC, ct.id ASC
                     """,
                     (session_id,),
                 )

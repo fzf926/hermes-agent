@@ -1349,6 +1349,23 @@ class APIServerAdapter(BasePlatformAdapter):
             "is_final": turn_status == "answered",
         }
 
+    @staticmethod
+    def _turn_status_from_agent_result(result: Optional[Dict[str, Any]]) -> str:
+        """Derive persisted conversation status consistently across API modes."""
+        if not isinstance(result, dict):
+            return "answered"
+        completed = bool(result.get("completed", True))
+        is_partial = bool(result.get("partial"))
+        is_failed = bool(result.get("failed"))
+        err_msg = result.get("error")
+        if is_failed or (not completed and err_msg):
+            return "error"
+        if is_partial:
+            return "interrupted"
+        if err_msg and not result.get("final_response"):
+            return "error"
+        return "answered"
+
     def _attach_sql_results(
         self,
         payload: Dict[str, Any],
@@ -2510,11 +2527,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._attach_sql_results(response_data, sql_records)
 
         effective_session_id = result.get("session_id", session_id)
-        turn_status = "answered"
-        if is_failed or (not completed and err_msg):
-            turn_status = "error"
-        elif is_partial:
-            turn_status = "interrupted"
+        turn_status = self._turn_status_from_agent_result(result)
         fulfillment = self._default_conversation_fulfillment(turn_status)
         self._attach_conversation(response_data, fulfillment)
         flow_step("post_agent", sql_count=len(sql_records), tool_count=len(tool_call_records))
@@ -2658,16 +2671,11 @@ class APIServerAdapter(BasePlatformAdapter):
             fulfillment: Dict[str, Any] = {}
             if mysql_question_text:
                 final_text = ""
-                turn_status = "answered"
+                turn_status = self._turn_status_from_agent_result(agent_result)
                 err_msg = None
                 if agent_result:
                     final_text = agent_result.get("final_response") or ""
-                    if agent_result.get("failed"):
-                        turn_status = "error"
-                        err_msg = agent_result.get("error")
-                    elif agent_result.get("partial"):
-                        turn_status = "interrupted"
-                        err_msg = agent_result.get("error")
+                    err_msg = agent_result.get("error")
                 flow_step(
                     "post_agent_stream",
                     sql_count=len(sql_records),
@@ -3255,7 +3263,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ],
             })
 
-            stream_turn_status = "error" if agent_error else "answered"
+            status_source = result if isinstance(result, dict) else ({"error": agent_error} if agent_error else None)
+            stream_turn_status = self._turn_status_from_agent_result(status_source)
             fulfillment = self._default_conversation_fulfillment(stream_turn_status)
             if mysql_question_text:
                 flow_step("build_response_stream", response_id=response_id)
@@ -3825,9 +3834,7 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         self._attach_sql_results(response_data, sql_records)
 
-        resp_turn_status = "answered"
-        if result.get("error"):
-            resp_turn_status = "error"
+        resp_turn_status = self._turn_status_from_agent_result(result)
         fulfillment = self._default_conversation_fulfillment(resp_turn_status)
         self._attach_conversation(response_data, fulfillment)
 

@@ -331,6 +331,10 @@
         "turn_no": {"type": "integer"},
         "question_message_id": {"type": "integer", "format": "int64"},
         "answer_message_id": {"type": "integer", "format": "int64"},
+        "hermes_response_id": {
+          "type": "string",
+          "description": "Assistant response id; pass this to POST /api/chat/favorites as hermes_response_id"
+        },
         "question_text": {"type": "string"},
         "answer_text": {"type": "string"},
         "status": {

@@ -1153,6 +1153,26 @@ class TestChatCompletionsEndpoint:
         assert data["conversation"]["is_final"] is True
         mock_judge.assert_not_awaited()
 
+    def test_agent_turn_status_mapping_is_shared_by_streaming_and_sync(self, adapter):
+        """Streaming and non-streaming paths should derive conversation status identically."""
+        partial_with_error = {
+            "final_response": "Here is part one",
+            "completed": False,
+            "partial": True,
+            "error": "Response truncated due to output length limit",
+        }
+        hard_failure = {
+            "final_response": None,
+            "completed": False,
+            "failed": True,
+            "error": "provider failed",
+        }
+        clean = {"final_response": "done", "completed": True}
+
+        assert adapter._turn_status_from_agent_result(partial_with_error) == "error"
+        assert adapter._turn_status_from_agent_result(hard_failure) == "error"
+        assert adapter._turn_status_from_agent_result(clean) == "answered"
+
     @pytest.mark.asyncio
     async def test_system_prompt_extracted(self, adapter):
         """System messages from the client are passed as ephemeral_system_prompt."""
