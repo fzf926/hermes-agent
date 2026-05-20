@@ -1349,6 +1349,39 @@ class APIServerAdapter(BasePlatformAdapter):
             "is_final": turn_status == "answered",
         }
 
+    def _conversation_fulfillment_from_turn(
+        self,
+        turn_status: str = "answered",
+        sql_executions: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Infer conversation fulfillment from deterministic turn signals."""
+        if turn_status != "answered":
+            return {
+                "fulfillment_status": "unsatisfied",
+                "fulfillment_reason": f"Turn status: {turn_status}",
+                "is_final": False,
+            }
+        sql_rows = list(sql_executions or [])
+        if not sql_rows:
+            return self._default_conversation_fulfillment(turn_status)
+        failed = [
+            row
+            for row in sql_rows
+            if str(row.get("status") or "").strip().lower() != "success"
+            or str(row.get("delivery_mode") or "").strip().lower() == "sql_only"
+        ]
+        if failed:
+            return {
+                "fulfillment_status": "unsatisfied",
+                "fulfillment_reason": "One or more SQL executions failed or were not executed.",
+                "is_final": False,
+            }
+        return {
+            "fulfillment_status": "satisfied",
+            "fulfillment_reason": "All SQL executions completed successfully.",
+            "is_final": True,
+        }
+
     @staticmethod
     def _turn_status_from_agent_result(result: Optional[Dict[str, Any]]) -> str:
         """Derive persisted conversation status consistently across API modes."""
@@ -2528,7 +2561,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         effective_session_id = result.get("session_id", session_id)
         turn_status = self._turn_status_from_agent_result(result)
-        fulfillment = self._default_conversation_fulfillment(turn_status)
+        fulfillment = self._conversation_fulfillment_from_turn(turn_status, sql_records)
         self._attach_conversation(response_data, fulfillment)
         flow_step("post_agent", sql_count=len(sql_records), tool_count=len(tool_call_records))
 
@@ -2681,7 +2714,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     sql_count=len(sql_records),
                     tool_count=len(tool_call_records),
                 )
-                fulfillment = self._default_conversation_fulfillment(turn_status)
+                fulfillment = self._conversation_fulfillment_from_turn(turn_status, sql_records)
                 effective_sid = (
                     (agent_result or {}).get("session_id") or session_id or ""
                 )
@@ -3265,7 +3298,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
             status_source = result if isinstance(result, dict) else ({"error": agent_error} if agent_error else None)
             stream_turn_status = self._turn_status_from_agent_result(status_source)
-            fulfillment = self._default_conversation_fulfillment(stream_turn_status)
+            fulfillment = self._conversation_fulfillment_from_turn(
+                stream_turn_status, sql_records
+            )
             if mysql_question_text:
                 flow_step("build_response_stream", response_id=response_id)
 
@@ -3835,7 +3870,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._attach_sql_results(response_data, sql_records)
 
         resp_turn_status = self._turn_status_from_agent_result(result)
-        fulfillment = self._default_conversation_fulfillment(resp_turn_status)
+        fulfillment = self._conversation_fulfillment_from_turn(resp_turn_status, sql_records)
         self._attach_conversation(response_data, fulfillment)
 
         # Store the complete response object for future chaining / GET retrieval

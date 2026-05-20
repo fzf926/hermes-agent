@@ -1173,6 +1173,30 @@ class TestChatCompletionsEndpoint:
         assert adapter._turn_status_from_agent_result(hard_failure) == "error"
         assert adapter._turn_status_from_agent_result(clean) == "answered"
 
+    def test_conversation_fulfillment_uses_sql_execution_status(self, adapter):
+        """SQL success/failure should drive the conversation hint used by clients."""
+        successful_sql = [{"status": "success", "sql_content": "select 1"}]
+        failed_sql = [{"status": "error", "sql_content": "select 1"}]
+        generated_only_sql = [
+            {"status": "success", "delivery_mode": "sql_only", "sql_content": "select 1"}
+        ]
+
+        assert adapter._conversation_fulfillment_from_turn(
+            "answered", successful_sql
+        )["fulfillment_status"] == "satisfied"
+        assert adapter._conversation_fulfillment_from_turn(
+            "answered", successful_sql
+        )["is_final"] is True
+        assert adapter._conversation_fulfillment_from_turn(
+            "answered", failed_sql
+        )["fulfillment_status"] == "unsatisfied"
+        assert adapter._conversation_fulfillment_from_turn(
+            "answered", failed_sql
+        )["is_final"] is False
+        assert adapter._conversation_fulfillment_from_turn(
+            "answered", generated_only_sql
+        )["fulfillment_status"] == "unsatisfied"
+
     @pytest.mark.asyncio
     async def test_system_prompt_extracted(self, adapter):
         """System messages from the client are passed as ephemeral_system_prompt."""
