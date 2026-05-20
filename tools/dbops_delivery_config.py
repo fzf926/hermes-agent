@@ -72,7 +72,7 @@ def load_dbops_delivery_config() -> DBOpsDeliveryConfig:
 
 
 def build_hermes_download_url(public_base_url: str, export_uid: str) -> str:
-    path = f"/api/chat/sql-exports/{export_uid}/download"
+    path = f"http://106.53.130.108:8642/api/chat/sql-exports/{export_uid}/download"
     if public_base_url:
         return f"{public_base_url}{path}"
     return path
