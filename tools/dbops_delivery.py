@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from gateway.chat_flow_timing import flow_step
 from tools.dbops_count import build_count_sql, build_paginated_sql
 from tools.dbops_delivery_config import (
     DBOpsDeliveryConfig,
@@ -139,6 +140,7 @@ def execute_with_volume_routing(
     """Run COUNT then deliver via inline, Excel, or DBOps export. Returns error string on failure."""
     cfg = delivery_cfg or load_dbops_delivery_config()
 
+    flow_step("dbops_count_start")
     count_cols, count_rows, count_data, count_err = _run_query(
         resolved,
         build_count_sql(resolved.sql_content),
@@ -173,7 +175,10 @@ def execute_with_volume_routing(
         )
         return DeliveryOutcome(text=user_display + reason_block + DBOPS_META_MARKER + json.dumps(meta, ensure_ascii=False), meta=meta)
 
+    flow_step("dbops_count_done", total_row_count=total)
+
     if total >= cfg.export_threshold:
+        flow_step("dbops_export_start", total_row_count=total)
         exported = run_dbops_export(
             instance_name=resolved.instance_name,
             db_name=resolved.db_name,
@@ -187,6 +192,7 @@ def execute_with_volume_routing(
         )
         if not exported.ok:
             return exported.error or "DBOps export failed"
+        flow_step("dbops_export_done", task_id=exported.task_id)
 
         meta["delivery_mode"] = "dbops_export"
         meta["download_url"] = exported.download_url
@@ -205,6 +211,7 @@ def execute_with_volume_routing(
         return DeliveryOutcome(text=message + DBOPS_META_MARKER + json.dumps(meta, ensure_ascii=False), meta=meta)
 
     if total >= cfg.excel_threshold_min:
+        flow_step("dbops_excel_start", total_row_count=total)
         page_size = cfg.pagination_page_size
         all_columns: list[Any] = []
         all_rows: list[list[Any]] = []
@@ -239,6 +246,7 @@ def execute_with_volume_routing(
             write_query_excel(export_path, columns=all_columns, rows=all_rows)
         except RuntimeError as exc:
             return str(exc)
+        flow_step("dbops_excel_done", export_uid=export_uid, row_count=total)
 
         download_url = build_hermes_download_url(cfg.public_base_url, export_uid)
         meta["delivery_mode"] = "excel"
@@ -259,6 +267,7 @@ def execute_with_volume_routing(
         return DeliveryOutcome(text=message + DBOPS_META_MARKER + json.dumps(meta, ensure_ascii=False), meta=meta)
 
     # inline: 1..20 (or up to excel_threshold_min - 1)
+    flow_step("dbops_inline_start", total_row_count=total)
     limit = min(total, 1000, max(resolved.limit_num, total))
     cols, rows, data, err = _run_query(
         resolved,
@@ -269,6 +278,7 @@ def execute_with_volume_routing(
     )
     if err:
         return err
+    flow_step("dbops_inline_done", row_count=len(rows))
 
     query_time = (data or {}).get("query_time")
     try:

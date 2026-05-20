@@ -27,6 +27,7 @@ Requires:
 """
 
 import asyncio
+import contextvars
 import hashlib
 import hmac
 import json
@@ -46,6 +47,14 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
+from gateway.chat_flow_timing import (
+    ChatFlowTimer,
+    bind_chat_flow_timer,
+    chat_flow_scope,
+    chat_flow_timing_enabled,
+    flow_step,
+    reset_chat_flow_timer,
+)
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -1159,6 +1168,7 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
+            flow_step("mysql_save_qa_turn_start")
             meta = store.save_qa_turn(
                 user_id=user_id,
                 hermes_session_id=hermes_session_id,
@@ -1177,23 +1187,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 is_final=is_final,
                 conversation_type=conversation_type,
             )
+            flow_step(
+                "mysql_save_qa_turn_done",
+                turn_id=(meta or {}).get("turn_id"),
+                session_id=(meta or {}).get("session_id"),
+            )
             if sql_executions and meta:
+                flow_step("mysql_save_sql_executions_start", sql_count=len(sql_executions))
                 store.save_sql_executions(
                     session_id=meta["session_id"],
                     turn_id=meta["turn_id"],
                     user_id=user_id,
                     executions=sql_executions,
                 )
+                flow_step("mysql_save_sql_executions_done", sql_count=len(sql_executions))
             if tool_calls and meta:
+                flow_step("mysql_save_tool_calls_start", tool_count=len(tool_calls))
                 store.save_tool_calls(
                     session_id=meta["session_id"],
                     turn_id=meta["turn_id"],
                     user_id=user_id,
                     calls=tool_calls,
                 )
+                flow_step("mysql_save_tool_calls_done", tool_count=len(tool_calls))
 
         try:
+            flow_step("mysql_persist_start", user_id=user_id, status=status)
             await loop.run_in_executor(None, _run)
+            flow_step("mysql_persist_done", user_id=user_id, status=status)
             if (
                 conversation_type == CONVERSATION_TYPE_FAVORITE
                 and favorite_id
@@ -1239,15 +1260,25 @@ class APIServerAdapter(BasePlatformAdapter):
         a = answer_text or ""
 
         def _run() -> Dict[str, Any]:
-            return judge_fulfillment(
+            flow_step("fulfillment_judge_llm_start", turn_status=turn_status)
+            result = judge_fulfillment(
                 question_text=q,
                 answer_text=a,
                 sql_executions=sql_executions,
                 turn_status=turn_status,
             )
+            flow_step(
+                "fulfillment_judge_llm_done",
+                turn_status=turn_status,
+                fulfillment_status=result.get("fulfillment_status"),
+            )
+            return result
 
         try:
-            return await loop.run_in_executor(None, _run)
+            flow_step("fulfillment_judge_start", turn_status=turn_status)
+            judged = await loop.run_in_executor(None, _run)
+            flow_step("fulfillment_judge_done", turn_status=turn_status)
+            return judged
         except Exception as exc:
             logger.warning("Fulfillment judge executor failed: %s", exc)
             return {
@@ -1432,24 +1463,30 @@ class APIServerAdapter(BasePlatformAdapter):
 
         store = self._get_chat_mysql_store()
 
-        try:
-            result = await self._run_mysql_chat_query(
-                lambda: store.list_turns_by_session_ref(session_ref)
-            )
-            if result.get("session") is None:
-                return web.json_response(
-                    _openai_error(f"Session not found: {session_ref}"),
-                    status=404,
+        with chat_flow_scope("chat.turns.list", request_id=session_ref):
+            flow_step("mysql_list_turns_start")
+            try:
+                result = await self._run_mysql_chat_query(
+                    lambda: store.list_turns_by_session_ref(session_ref)
                 )
-            return web.json_response(result)
-        except Exception as exc:
-            logger.warning(
-                "Failed to list chat turns for session %s: %s", session_ref, exc, exc_info=True
-            )
-            return web.json_response(
-                _openai_error(f"Failed to list turns: {exc}", err_type="server_error"),
-                status=500,
-            )
+                flow_step("mysql_list_turns_done", total=result.get("total", 0))
+                if result.get("session") is None:
+                    return web.json_response(
+                        _openai_error(f"Session not found: {session_ref}"),
+                        status=404,
+                    )
+                return web.json_response(result)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to list chat turns for session %s: %s",
+                    session_ref,
+                    exc,
+                    exc_info=True,
+                )
+                return web.json_response(
+                    _openai_error(f"Failed to list turns: {exc}", err_type="server_error"),
+                    status=500,
+                )
 
     async def _handle_create_sql_favorite(self, request: "web.Request") -> "web.Response":
         """POST /api/chat/favorites — favorite SQL from a satisfied turn."""
@@ -1937,11 +1974,36 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        flow_timer: Optional[ChatFlowTimer] = None
+        flow_token = None
+        if chat_flow_timing_enabled():
+            flow_timer = ChatFlowTimer(
+                "chat.completions",
+                request_id=(request.headers.get("X-Request-Id") or uuid.uuid4().hex[:12]),
+            )
+            flow_token = bind_chat_flow_timer(flow_timer)
+        try:
+            return await self._handle_chat_completions_inner(request, flow_timer)
+        finally:
+            if flow_timer is not None:
+                flow_timer.finish()
+            if flow_token is not None:
+                reset_chat_flow_timer(flow_token)
+
+    async def _handle_chat_completions_inner(
+        self,
+        request: "web.Request",
+        flow_timer: Optional[ChatFlowTimer],
+    ) -> "web.Response":
+        """Core chat completions handler (timed via optional flow_timer)."""
+        _ = flow_timer
+
         # Parse request body
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+        flow_step("parse_request", stream=bool(body.get("stream")))
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -2047,6 +2109,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+        flow_step("resolve_session", session_id=session_id, history_len=len(history))
 
         system_prompt, conv_err, conv_early_reply = self._resolve_conversation_mode(
             request,
@@ -2057,6 +2120,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if conv_err is not None:
             return conv_err
+        flow_step("resolve_conversation_mode_done")
 
         conversation_type = parse_conversation_type(body)
         favorite_id = parse_favorite_id(body) if conversation_type == CONVERSATION_TYPE_FAVORITE else None
@@ -2070,8 +2134,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 return type_err
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        if flow_timer is not None:
+            flow_timer.request_id = completion_id
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        flow_step("prepare_request", session_id=session_id, stream=stream, user_id=user_id or "")
 
         if conv_early_reply:
             return await self._return_prompt_only_chat_completion(
@@ -2153,17 +2220,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     sql_records, tool_call_id, function_name, function_args, function_result
                 )
                 started_at = tool_call_started_at.pop(tool_call_id, None)
+                latency_ms = (
+                    int((time.monotonic() - started_at) * 1000)
+                    if started_at is not None
+                    else None
+                )
                 _append_tool_call_record(
                     tool_call_records,
                     tool_call_id,
                     function_name,
                     function_args,
                     function_result,
-                    latency_ms=(
-                        int((time.monotonic() - started_at) * 1000)
-                        if started_at is not None
-                        else None
-                    ),
+                    latency_ms=latency_ms,
+                )
+                flow_step(
+                    "tool_complete",
+                    tool=function_name,
+                    latency_ms=latency_ms or 0,
                 )
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
@@ -2183,6 +2256,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            flow_step("agent_run_start", mode="stream")
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -2221,20 +2295,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 sql_records, tool_call_id, function_name, function_args, function_result
             )
             started_at = tool_call_started_at.pop(tool_call_id, None)
+            latency_ms = (
+                int((time.monotonic() - started_at) * 1000)
+                if started_at is not None
+                else None
+            )
             _append_tool_call_record(
                 tool_call_records,
                 tool_call_id,
                 function_name,
                 function_args,
                 function_result,
-                latency_ms=(
-                    int((time.monotonic() - started_at) * 1000)
-                    if started_at is not None
-                    else None
-                ),
+                latency_ms=latency_ms,
             )
+            flow_step("tool_complete", tool=function_name, latency_ms=latency_ms or 0)
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
+        flow_step("agent_run_start", mode="sync")
         async def _compute_completion():
             return await self._run_agent(
                 user_message=user_message,
@@ -2352,6 +2429,7 @@ class APIServerAdapter(BasePlatformAdapter):
             turn_status = "error"
         elif is_partial:
             turn_status = "interrupted"
+        flow_step("post_agent", sql_count=len(sql_records), tool_count=len(tool_call_records))
         fulfillment = await self._judge_fulfillment(
             question_text=self._content_to_storage_text(user_message),
             answer_text=final_response or None,
@@ -2509,6 +2587,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     elif agent_result.get("partial"):
                         turn_status = "interrupted"
                         err_msg = agent_result.get("error")
+                flow_step(
+                    "post_agent_stream",
+                    sql_count=len(sql_records),
+                    tool_count=len(tool_call_records),
+                )
                 fulfillment = await self._judge_fulfillment(
                     question_text=mysql_question_text,
                     answer_text=final_text or None,
@@ -3023,6 +3106,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = str(e)
 
+            flow_step(
+                "post_agent_stream",
+                sql_count=len(sql_records),
+                tool_count=len(tool_call_records),
+                completed=result.get("completed") if isinstance(result, dict) else None,
+                partial=result.get("partial") if isinstance(result, dict) else None,
+                failed=result.get("failed") if isinstance(result, dict) else None,
+            )
+
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
             if message_opened:
@@ -3090,6 +3182,7 @@ class APIServerAdapter(BasePlatformAdapter):
             stream_fulfillment: Dict[str, Any] = {}
             stream_turn_status = "error" if agent_error else "answered"
             if mysql_question_text:
+                flow_step("build_response_stream", response_id=response_id)
                 stream_fulfillment = await self._judge_fulfillment(
                     question_text=mysql_question_text,
                     answer_text=final_response_text or None,
@@ -3141,10 +3234,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     result,
                     final_response_text,
                 )
+                if store:
+                    flow_step("response_store_put_start", response_id=response_id)
                 _persist_response_snapshot(
                     completed_env,
                     conversation_history_snapshot=full_history,
                 )
+                if store:
+                    flow_step("response_store_put_done", response_id=response_id)
                 terminal_snapshot_persisted = True
                 await _write_event("response.completed", {
                     "type": "response.completed",
@@ -3240,6 +3337,30 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        flow_timer: Optional[ChatFlowTimer] = None
+        flow_token = None
+        if chat_flow_timing_enabled():
+            flow_timer = ChatFlowTimer(
+                "responses",
+                request_id=(request.headers.get("X-Request-Id") or uuid.uuid4().hex[:12]),
+            )
+            flow_token = bind_chat_flow_timer(flow_timer)
+        try:
+            return await self._handle_responses_inner(request, flow_timer)
+        finally:
+            if flow_timer is not None:
+                flow_timer.finish()
+            if flow_token is not None:
+                reset_chat_flow_timer(flow_token)
+
+    async def _handle_responses_inner(
+        self,
+        request: "web.Request",
+        flow_timer: Optional[ChatFlowTimer],
+    ) -> "web.Response":
+        """Core responses handler (timed via optional flow_timer)."""
+        _ = flow_timer
+
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
@@ -3253,6 +3374,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
                 status=400,
             )
+        flow_step("parse_request", stream=bool(body.get("stream")))
 
         raw_input = body.get("input")
         if raw_input is None:
@@ -3319,6 +3441,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
+            flow_step("load_previous_response_start", previous_response_id=previous_response_id)
             stored = self._response_store.get(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
@@ -3327,6 +3450,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
+            flow_step(
+                "load_previous_response_done",
+                history_len=len(conversation_history),
+                session_id=stored_session_id or "",
+            )
 
         # Append new input messages to history (all but the last become history)
         for msg in input_messages[:-1]:
@@ -3348,6 +3476,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if conv_err is not None:
             return conv_err
+        flow_step("resolve_conversation_mode_done")
 
         conversation_type = parse_conversation_type(body)
         favorite_id = parse_favorite_id(body) if conversation_type == CONVERSATION_TYPE_FAVORITE else None
@@ -3362,6 +3491,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 return type_err
 
         stream = bool(body.get("stream", False))
+        flow_step(
+            "prepare_request",
+            session_id=session_id,
+            stream=stream,
+            user_id=user_id or "",
+            history_len=len(conversation_history),
+        )
 
         if conv_early_reply:
             return await self._return_prompt_only_response(
@@ -3424,17 +3560,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     sql_records, tool_call_id, function_name, function_args, function_result
                 )
                 started_at = tool_call_started_at.pop(tool_call_id, None)
+                latency_ms = (
+                    int((time.monotonic() - started_at) * 1000)
+                    if started_at is not None
+                    else None
+                )
                 _append_tool_call_record(
                     tool_call_records,
                     tool_call_id,
                     function_name,
                     function_args,
                     function_result,
-                    latency_ms=(
-                        int((time.monotonic() - started_at) * 1000)
-                        if started_at is not None
-                        else None
-                    ),
+                    latency_ms=latency_ms,
+                )
+                flow_step(
+                    "tool_complete",
+                    tool=function_name,
+                    latency_ms=latency_ms or 0,
                 )
                 _stream_q.put(("__tool_completed__", {
                     "tool_call_id": tool_call_id,
@@ -3444,6 +3586,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
 
             agent_ref = [None]
+            flow_step("agent_run_start", mode="stream")
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -3461,6 +3604,8 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            if flow_timer is not None:
+                flow_timer.request_id = response_id
             model_name = body.get("model", self._model_name)
             created_at = int(time.time())
 
@@ -3498,19 +3643,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 sql_records, tool_call_id, function_name, function_args, function_result
             )
             started_at = tool_call_started_at.pop(tool_call_id, None)
+            latency_ms = (
+                int((time.monotonic() - started_at) * 1000)
+                if started_at is not None
+                else None
+            )
             _append_tool_call_record(
                 tool_call_records,
                 tool_call_id,
                 function_name,
                 function_args,
                 function_result,
-                latency_ms=(
-                    int((time.monotonic() - started_at) * 1000)
-                    if started_at is not None
-                    else None
-                ),
+                latency_ms=latency_ms,
+            )
+            flow_step(
+                "tool_complete",
+                tool=function_name,
+                latency_ms=latency_ms or 0,
             )
 
+        flow_step("agent_run_start", mode="sync")
         async def _compute_response():
             return await self._run_agent(
                 user_message=user_message,
@@ -3550,8 +3702,20 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final_response:
             final_response = result.get("error", "(No response generated)")
 
+        flow_step(
+            "post_agent",
+            sql_count=len(sql_records),
+            tool_count=len(tool_call_records),
+            completed=result.get("completed"),
+            partial=result.get("partial"),
+            failed=result.get("failed"),
+        )
+
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        if flow_timer is not None:
+            flow_timer.request_id = response_id
         created_at = int(time.time())
+        flow_step("build_response", response_id=response_id)
 
         # Build the full conversation history for storage
         # (includes tool calls from the agent run)
@@ -3600,6 +3764,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
+            flow_step("response_store_put_start", response_id=response_id)
             self._response_store.put(response_id, {
                 "response": response_data,
                 "conversation_history": full_history,
@@ -3610,6 +3775,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # conversation name automatically chains to this response
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
+        if store:
+            flow_step("response_store_put_done", response_id=response_id)
 
         response_headers = {"X-Hermes-Session-Id": session_id}
         if gateway_session_key:
@@ -4027,6 +4194,7 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
+            flow_step("agent_create_start")
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
@@ -4036,13 +4204,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
             )
+            flow_step("agent_create_done")
             if agent_ref is not None:
                 agent_ref[0] = agent
             effective_task_id = session_id or str(uuid.uuid4())
+            flow_step("agent_run_conversation_start", task_id=effective_task_id)
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 task_id=effective_task_id,
+            )
+            flow_step(
+                "agent_run_conversation_done",
+                completed=result.get("completed"),
+                partial=result.get("partial"),
+                failed=result.get("failed"),
             )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -4057,7 +4233,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 result["session_id"] = _eff_sid
             return result, usage
 
-        return await loop.run_in_executor(None, _run)
+        # Propagate ChatFlowTimer (and other contextvars) into the worker thread
+        # so agent_create_*, agent_run_conversation_*, and tool_complete log.
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(None, ctx.run, _run)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
