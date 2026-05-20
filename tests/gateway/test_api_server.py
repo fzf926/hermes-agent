@@ -2652,12 +2652,26 @@ class TestCORS:
     def test_origin_rejected_by_default(self, adapter):
         assert adapter._origin_allowed("http://evil.example") is False
 
+    def test_origin_allowed_for_localhost_without_config(self, adapter):
+        assert adapter._origin_allowed("http://localhost:5050") is True
+        assert adapter._origin_allowed("http://127.0.0.1:5173") is True
+
+    def test_origin_allowed_for_lan_ip_without_config(self, adapter):
+        assert adapter._origin_allowed("http://10.240.26.178:5050") is True
+        assert adapter._cors_headers_for_origin("http://10.240.26.178:5050") is not None
+
+    def test_cors_headers_for_localhost_without_config(self, adapter):
+        headers = adapter._cors_headers_for_origin("http://localhost:5050")
+        assert headers is not None
+        assert headers["Access-Control-Allow-Origin"] == "http://localhost:5050"
+
     def test_origin_allowed_for_allowlist_match(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         assert adapter._origin_allowed("http://localhost:3000") is True
 
     def test_cors_headers_for_origin_disabled_by_default(self, adapter):
-        assert adapter._cors_headers_for_origin("http://localhost:3000") is None
+        assert adapter._cors_headers_for_origin("http://evil.example") is None
+        assert adapter._cors_headers_for_origin("http://localhost:3000") is not None
 
     def test_cors_headers_for_origin_matches_allowlist(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
@@ -2687,6 +2701,47 @@ class TestCORS:
             resp = await cli.get("/health", headers={"Origin": "http://evil.example"})
             assert resp.status == 403
             assert resp.headers.get("Access-Control-Allow-Origin") is None
+
+    @pytest.mark.asyncio
+    async def test_browser_localhost_origin_allowed_without_config(self, adapter):
+        """Loopback dev origins work without API_SERVER_CORS_ORIGINS."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/health", headers={"Origin": "http://localhost:5050"})
+            assert resp.status == 200
+            assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:5050"
+
+    @pytest.mark.asyncio
+    async def test_browser_lan_ip_origin_allowed_without_config(self, adapter):
+        """RFC1918 LAN origins (e.g. Wi-Fi dev server) work without explicit CORS config."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/chat/favorites",
+                headers={"Origin": "http://10.240.26.178:5050"},
+                json={"hermes_response_id": "resp_test"},
+            )
+            assert resp.status != 403
+
+    @pytest.mark.asyncio
+    async def test_cors_options_preflight_localhost_allowed_without_config(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.options(
+                "/v1/responses",
+                headers={
+                    "Origin": "http://localhost:5050",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": (
+                        "Authorization, Content-Type, X-Hermes-User-Id, X-Hermes-Session-Key"
+                    ),
+                },
+            )
+            assert resp.status == 200
+            assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:5050"
+            allow_headers = resp.headers.get("Access-Control-Allow-Headers", "")
+            assert "X-Hermes-User-Id" in allow_headers
+            assert "X-Hermes-Session-Key" in allow_headers
 
     @pytest.mark.asyncio
     async def test_cors_options_preflight_rejected_by_default(self, adapter):
@@ -3071,8 +3126,10 @@ class TestSessionKeyHeader:
                 )
             assert resp.status == 200
             assert resp.headers.get("X-Hermes-Session-Key") == "webui:user-42"
+            assert resp.headers.get("X-Hermes-Session-Id") == "webui:user-42"
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["gateway_session_key"] == "webui:user-42"
+            assert call_kwargs["session_id"] == "webui:user-42"
 
     @pytest.mark.asyncio
     async def test_session_key_independent_of_session_id(self, auth_adapter):
@@ -3207,8 +3264,35 @@ class TestSessionKeyHeader:
                 )
             assert resp.status == 200
             assert resp.headers.get("X-Hermes-Session-Key") == "webui:chan-1"
+            assert resp.headers.get("X-Hermes-Session-Id") == "webui:chan-1"
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["gateway_session_key"] == "webui:chan-1"
+            assert call_kwargs["session_id"] == "webui:chan-1"
+
+    def test_resolve_hermes_session_id_prefers_session_key_over_random(self, auth_adapter):
+        """Same X-Hermes-Session-Key must map to one hermes_session_id (MySQL dialog)."""
+        request = MagicMock()
+        request.headers = {"X-Hermes-Session-Key": "321_1779259654542"}
+        session_id, err = auth_adapter._resolve_hermes_session_id(
+            request,
+            gateway_session_key="321_1779259654542",
+        )
+        assert err is None
+        assert session_id == "321_1779259654542"
+
+    def test_resolve_hermes_session_id_session_id_overrides_key(self, auth_adapter):
+        request = MagicMock()
+        request.headers = {
+            "X-Hermes-Session-Id": "transcript-xyz",
+            "X-Hermes-Session-Key": "321_1779259654542",
+            "Authorization": "Bearer sk-secret",
+        }
+        session_id, err = auth_adapter._resolve_hermes_session_id(
+            request,
+            gateway_session_key="321_1779259654542",
+        )
+        assert err is None
+        assert session_id == "transcript-xyz"
 
     @pytest.mark.asyncio
     async def test_capabilities_advertises_session_key_header(self, adapter):

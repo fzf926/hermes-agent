@@ -30,6 +30,7 @@ import asyncio
 import contextvars
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ import sqlite3
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 try:
     from aiohttp import web
@@ -486,8 +488,19 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Idempotency-Key, "
+        "X-Hermes-User-Id, X-Hermes-Session-Id, X-Hermes-Session-Key"
+    ),
 }
+
+# Browser dev frontends on loopback or RFC1918 LAN IPs (any port) are allowed in
+# addition to API_SERVER_CORS_ORIGINS — typical for Vite/webpack on localhost:5050
+# or http://10.x.x.x:5050 when testing from another machine on the same Wi-Fi.
+_LOCAL_DEV_ORIGIN_RE = re.compile(
+    r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$",
+    re.IGNORECASE,
+)
 
 
 if AIOHTTP_AVAILABLE:
@@ -736,35 +749,54 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
         return "hermes-agent"
 
+    @staticmethod
+    def _is_local_dev_origin(origin: str) -> bool:
+        """True for dev browser origins: loopback hostnames or private/LAN IPv4/IPv6."""
+        raw = (origin or "").strip()
+        if not raw:
+            return False
+        if _LOCAL_DEV_ORIGIN_RE.match(raw):
+            return True
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            return False
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return False
+        host = (parsed.hostname or "").strip()
+        if not host:
+            return False
+        if host.lower() == "localhost":
+            return True
+        try:
+            addr = ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            return False
+        return addr.is_loopback or addr.is_private
+
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
-        if not origin or not self._cors_origins:
-            return None
-
-        if "*" in self._cors_origins:
-            headers = dict(_CORS_HEADERS)
-            headers["Access-Control-Allow-Origin"] = "*"
-            headers["Access-Control-Max-Age"] = "600"
-            return headers
-
-        if origin not in self._cors_origins:
+        if not origin or not self._origin_allowed(origin):
             return None
 
         headers = dict(_CORS_HEADERS)
-        headers["Access-Control-Allow-Origin"] = origin
-        headers["Vary"] = "Origin"
+        if "*" in self._cors_origins:
+            headers["Access-Control-Allow-Origin"] = "*"
+        else:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
         headers["Access-Control-Max-Age"] = "600"
         return headers
 
     def _origin_allowed(self, origin: str) -> bool:
-        """Allow non-browser clients and explicitly configured browser origins."""
+        """Allow non-browser clients, configured origins, and dev loopback/LAN origins."""
         if not origin:
             return True
 
-        if not self._cors_origins:
-            return False
+        if "*" in self._cors_origins or origin in self._cors_origins:
+            return True
 
-        return "*" in self._cors_origins or origin in self._cors_origins
+        return self._is_local_dev_origin(origin)
 
     # ------------------------------------------------------------------
     # Auth helper
@@ -1740,6 +1772,60 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _resolve_hermes_session_id(
+        self,
+        request: "web.Request",
+        *,
+        gateway_session_key: Optional[str] = None,
+        stored_session_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        first_user_message: str = "",
+        allow_derived: bool = False,
+    ) -> tuple[str, Optional["web.Response"]]:
+        """Resolve transcript / MySQL ``hermes_session_id`` for this request.
+
+        Precedence:
+        1. ``X-Hermes-Session-Id`` (explicit transcript continuation)
+        2. ``stored_session_id`` from ``previous_response_id`` chaining
+        3. ``gateway_session_key`` (``X-Hermes-Session-Key``) — one dialog per key
+        4. Derived fingerprint (chat completions only, when ``allow_derived``)
+        5. Random UUID (responses API fallback)
+        """
+        provided = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if provided:
+            if not self._api_key:
+                logger.warning(
+                    "Session continuation via X-Hermes-Session-Id rejected: "
+                    "no API key configured.  Set API_SERVER_KEY to enable "
+                    "session continuity."
+                )
+                return "", web.json_response(
+                    _openai_error(
+                        "Session continuation requires API key authentication. "
+                        "Configure API_SERVER_KEY to enable this feature."
+                    ),
+                    status=403,
+                )
+            if re.search(r"[\r\n\x00]", provided):
+                return "", web.json_response(
+                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                    status=400,
+                )
+            return provided, None
+
+        if stored_session_id:
+            return stored_session_id, None
+
+        if gateway_session_key:
+            return gateway_session_key, None
+
+        if allow_derived:
+            first_user = (first_user_message or "").strip()
+            if first_user:
+                return _derive_chat_session_id(system_prompt, first_user), None
+
+        return str(uuid.uuid4()), None
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -2061,35 +2147,24 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
-        # When provided, history is loaded from state.db instead of from the request body.
-        #
-        # Security: session continuation exposes conversation history, so it is
-        # only allowed when the API key is configured and the request is
-        # authenticated.  Without this gate, any unauthenticated client could
-        # read arbitrary session history by guessing/enumerating session IDs.
+        # Resolve transcript session id (MySQL hermes_session_id + state.db).
+        first_user = ""
+        for cm in conversation_messages:
+            if cm.get("role") == "user":
+                first_user = cm.get("content", "")
+                break
+        session_id, session_err = self._resolve_hermes_session_id(
+            request,
+            gateway_session_key=gateway_session_key,
+            system_prompt=system_prompt,
+            first_user_message=first_user,
+            allow_derived=True,
+        )
+        if session_err is not None:
+            return session_err
+
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
-            if not self._api_key:
-                logger.warning(
-                    "Session continuation via X-Hermes-Session-Id rejected: "
-                    "no API key configured.  Set API_SERVER_KEY to enable "
-                    "session continuity."
-                )
-                return web.json_response(
-                    _openai_error(
-                        "Session continuation requires API key authentication. "
-                        "Configure API_SERVER_KEY to enable this feature."
-                    ),
-                    status=403,
-                )
-            # Sanitize: reject control characters that could enable header injection.
-            if re.search(r'[\r\n\x00]', provided_session_id):
-                return web.json_response(
-                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
-                    status=400,
-                )
-            session_id = provided_session_id
             try:
                 db = self._ensure_session_db()
                 if db is not None:
@@ -2097,18 +2172,6 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
-        else:
-            # Derive a stable session ID from the conversation fingerprint so
-            # that consecutive messages from the same Open WebUI (or similar)
-            # conversation map to the same Hermes session.  The first user
-            # message + system prompt are constant across all turns.
-            first_user = ""
-            for cm in conversation_messages:
-                if cm.get("role") == "user":
-                    first_user = cm.get("content", "")
-                    break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
-            # history already set from request body above
         flow_step("resolve_session", session_id=session_id, history_len=len(history))
 
         system_prompt, conv_err, conv_early_reply = self._resolve_conversation_mode(
@@ -3480,7 +3543,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         conversation_type = parse_conversation_type(body)
         favorite_id = parse_favorite_id(body) if conversation_type == CONVERSATION_TYPE_FAVORITE else None
-        session_id = stored_session_id or str(uuid.uuid4())
+        session_id, session_err = self._resolve_hermes_session_id(
+            request,
+            gateway_session_key=gateway_session_key,
+            stored_session_id=stored_session_id,
+        )
+        if session_err is not None:
+            return session_err
         if user_id:
             type_err = await self._assert_mysql_session_conversation_type(
                 user_id=user_id,
