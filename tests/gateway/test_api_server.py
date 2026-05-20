@@ -403,6 +403,32 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+    def test_direct_conversation_type_scopes_session_key(self, adapter):
+        request = MagicMock()
+        request.headers = {}
+
+        session_id, err = adapter._resolve_hermes_session_id(
+            request,
+            gateway_session_key="123456_1779282151092",
+            conversation_type=3,
+        )
+
+        assert err is None
+        assert session_id == "123456_1779282151092:conversation_type:3"
+
+    def test_history_conversation_type_keeps_session_key(self, adapter):
+        request = MagicMock()
+        request.headers = {}
+
+        session_id, err = adapter._resolve_hermes_session_id(
+            request,
+            gateway_session_key="123456_1779282151092",
+            conversation_type=1,
+        )
+
+        assert err is None
+        assert session_id == "123456_1779282151092"
+
     @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()

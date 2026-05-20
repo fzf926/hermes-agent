@@ -1854,6 +1854,7 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt: Optional[str] = None,
         first_user_message: str = "",
         allow_derived: bool = False,
+        conversation_type: int = 1,
     ) -> tuple[str, Optional["web.Response"]]:
         """Resolve transcript / MySQL ``hermes_session_id`` for this request.
 
@@ -1890,6 +1891,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return stored_session_id, None
 
         if gateway_session_key:
+            if conversation_type != 1:
+                return f"{gateway_session_key}:conversation_type:{conversation_type}", None
             return gateway_session_key, None
 
         if allow_derived:
@@ -2210,6 +2213,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_message_text = self._content_to_storage_text(user_message)
+        conversation_type = parse_conversation_type(body)
 
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
@@ -2232,6 +2236,7 @@ class APIServerAdapter(BasePlatformAdapter):
             system_prompt=system_prompt,
             first_user_message=first_user,
             allow_derived=True,
+            conversation_type=conversation_type,
         )
         if session_err is not None:
             return session_err
@@ -2258,7 +2263,6 @@ class APIServerAdapter(BasePlatformAdapter):
             return conv_err
         flow_step("resolve_conversation_mode_done")
 
-        conversation_type = parse_conversation_type(body)
         favorite_id = parse_favorite_id(body) if conversation_type == CONVERSATION_TYPE_FAVORITE else None
         if user_id:
             type_err = await self._assert_mysql_session_conversation_type(
@@ -3596,6 +3600,7 @@ class APIServerAdapter(BasePlatformAdapter):
             request,
             gateway_session_key=gateway_session_key,
             stored_session_id=stored_session_id,
+            conversation_type=conversation_type,
         )
         if session_err is not None:
             return session_err
