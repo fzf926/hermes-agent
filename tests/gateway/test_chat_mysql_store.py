@@ -108,3 +108,151 @@ def test_list_turns_includes_assistant_hermes_response_id():
     result = store.list_turns_by_session_ref("s1")
 
     assert result["turns"][0]["hermes_response_id"] == "chatcmpl_turn_1"
+
+
+class _FavoriteCursor:
+    def __init__(self):
+        self._rows = []
+        self.lastrowid = None
+        self.inserted_favorite_response_id = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=None):
+        if "FROM chat_message" in sql:
+            if "hermes_response_id" not in sql:
+                self._rows = []
+                return
+            requested = {str(p) for p in (params or ())}
+            if requested & {"22", "resp_response_1"}:
+                self._rows = [
+                    {
+                        "id": 22,
+                        "session_id": 7,
+                        "turn_no": 1,
+                        "user_id": "user-1",
+                        "role": "assistant",
+                        "hermes_response_id": "resp_response_1",
+                    }
+                ]
+            else:
+                self._rows = []
+        elif "FROM chat_turn" in sql:
+            self._rows = [
+                {
+                    "id": 11,
+                    "session_id": 7,
+                    "user_id": "user-1",
+                    "turn_no": 1,
+                    "question_text": "查一下订单",
+                    "answer_text": "查询完成",
+                    "fulfillment_status": "satisfied",
+                    "fulfillment_reason": "All SQL executions completed successfully.",
+                    "is_final": 1,
+                }
+            ]
+        elif "FROM chat_sql_favorite f" in sql and "WHERE f.user_id" in sql:
+            self._rows = []
+        elif "FROM chat_sql_execution" in sql:
+            self._rows = [{"id": 31, "status": "success", "query_time_ms": 1200}]
+        elif "INSERT INTO chat_sql_favorite " in sql:
+            self.inserted_favorite_response_id = params[5]
+            self.lastrowid = 41
+            self._rows = []
+        elif "INSERT INTO chat_sql_favorite_item" in sql:
+            self._rows = []
+        elif "FROM chat_sql_favorite f" in sql and "WHERE f.id" in sql:
+            self._rows = [
+                {
+                    "id": 41,
+                    "favorite_uid": "fav-1",
+                    "user_id": "user-1",
+                    "session_id": 7,
+                    "session_uid": "s1",
+                    "hermes_session_id": "hs1",
+                    "turn_id": 11,
+                    "turn_no": 1,
+                    "hermes_response_id": self.inserted_favorite_response_id,
+                    "question_summary": "查订单",
+                    "answer_summary": "查询完成",
+                    "fulfillment_status": "satisfied",
+                    "fulfillment_reason": "All SQL executions completed successfully.",
+                    "sql_count": 1,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            ]
+        elif "SELECT sql_content" in sql:
+            self._rows = []
+        else:
+            self._rows = []
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _FavoriteConnection:
+    def __init__(self):
+        self.cursor_obj = _FavoriteCursor()
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def close(self):
+        self.closed = True
+
+
+def test_create_sql_favorite_accepts_response_api_hermes_response_id(monkeypatch):
+    store = ChatMySQLStore.__new__(ChatMySQLStore)
+    conn = _FavoriteConnection()
+    store._connect = lambda: conn
+    monkeypatch.setattr(
+        "gateway.chat_mysql_store.summarize_favorite_turn",
+        lambda **_: {"question_summary": "查订单", "answer_summary": "查询完成"},
+    )
+
+    result = store.create_sql_favorite(
+        user_id="user-1",
+        hermes_response_id="resp_response_1",
+    )
+
+    assert result["ok"] is True
+    assert result["created"] is True
+    assert conn.cursor_obj.inserted_favorite_response_id == "resp_response_1"
+    assert result["favorite"]["hermes_response_id"] == "resp_response_1"
+
+
+def test_create_sql_favorite_resolves_message_primary_id_to_hermes_response_id(monkeypatch):
+    store = ChatMySQLStore.__new__(ChatMySQLStore)
+    conn = _FavoriteConnection()
+    store._connect = lambda: conn
+    monkeypatch.setattr(
+        "gateway.chat_mysql_store.summarize_favorite_turn",
+        lambda **_: {"question_summary": "查订单", "answer_summary": "查询完成"},
+    )
+
+    result = store.create_sql_favorite(
+        user_id="user-1",
+        hermes_response_id="22",
+    )
+
+    assert result["ok"] is True
+    assert result["created"] is True
+    assert conn.cursor_obj.inserted_favorite_response_id == "resp_response_1"
+    assert result["favorite"]["hermes_response_id"] == "resp_response_1"

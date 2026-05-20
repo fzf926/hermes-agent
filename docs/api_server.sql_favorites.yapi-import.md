@@ -92,6 +92,8 @@ Content-Type: application/json
 }
 ```
 
+`hermes_response_id` 兼容三种来源：`/v1/responses` 返回的 `response.id`、对话轮次接口返回的 `hermes_response_id`，以及 `chat_message.id` 主键。若传主键，后端会先解析出对应的 `chat_message.hermes_response_id`，再创建收藏。
+
 成功：`201`（新建）或 `200`（已存在）。响应字段 `favorite.question_summary` / `answer_summary` 为 AI 摘要。
 
 ### 2. 收藏列表

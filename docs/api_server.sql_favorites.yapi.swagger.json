@@ -29,7 +29,7 @@
       "post": {
         "tags": ["sql_favorites"],
         "summary": "收藏一轮符合条件的 SQL",
-        "description": "根据 hermes_response_id 定位 chat_message → chat_turn → chat_sql_execution，写入收藏表。必须存在 SQL，且每条 SQL status=success、query_time_ms 非空并 <= 5000；同一 user_id + hermes_response_id 幂等（已存在返回 200）。创建时调用辅助 LLM 生成 question_summary / answer_summary，不存完整问答原文。",
+        "description": "根据 hermes_response_id 定位 chat_message → chat_turn → chat_sql_execution，写入收藏表。hermes_response_id 兼容 /v1/responses 返回的 response.id、对话轮次接口返回的 hermes_response_id，以及 chat_message.id 主键；若传主键，后端会解析为对应的 chat_message.hermes_response_id 后再收藏。必须存在 SQL，且每条 SQL status=success、query_time_ms 非空并 <= 5000；同一 user_id + hermes_response_id 幂等（已存在返回 200）。创建时调用辅助 LLM 生成 question_summary / answer_summary，不存完整问答原文。",
         "security": [{"BearerAuth": []}],
         "parameters": [
           {
@@ -330,7 +330,7 @@
       "properties": {
         "hermes_response_id": {
           "type": "string",
-          "description": "助手回复 ID（/v1/responses 返回的 response id，存于 chat_message.hermes_response_id）",
+          "description": "助手回复 ID。兼容 /v1/responses 返回的 response.id、对话轮次接口返回的 hermes_response_id，或 chat_message.id 主键；传主键时后端会解析为对应的 chat_message.hermes_response_id。",
           "example": "resp_abc123"
         },
         "user_id": {

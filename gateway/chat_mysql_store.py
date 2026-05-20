@@ -954,16 +954,28 @@ class ChatMySQLStore:
         conn = self._connect()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, session_id, turn_no, user_id, role
-                    FROM chat_message
-                    WHERE id = %s
-                    ORDER BY FIELD(role, 'assistant', 'user'), id DESC
-                    LIMIT 1
-                    """,
-                    (resp_id,),
-                )
+                if resp_id.isdigit():
+                    cur.execute(
+                        """
+                        SELECT id, session_id, turn_no, user_id, role, hermes_response_id
+                        FROM chat_message
+                        WHERE id = %s OR hermes_response_id = %s
+                        ORDER BY FIELD(role, 'assistant', 'user'), id DESC
+                        LIMIT 1
+                        """,
+                        (int(resp_id), resp_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, session_id, turn_no, user_id, role, hermes_response_id
+                        FROM chat_message
+                        WHERE hermes_response_id = %s
+                        ORDER BY FIELD(role, 'assistant', 'user'), id DESC
+                        LIMIT 1
+                        """,
+                        (resp_id,),
+                    )
                 msg = cur.fetchone()
                 if not msg:
                     return {
@@ -982,6 +994,7 @@ class ChatMySQLStore:
 
                 session_id = int(msg["session_id"])
                 turn_no = int(msg["turn_no"])
+                canonical_resp_id = str(msg.get("hermes_response_id") or "").strip() or resp_id
 
                 cur.execute(
                     """
@@ -1023,7 +1036,7 @@ class ChatMySQLStore:
                     WHERE f.user_id = %s AND f.hermes_response_id = %s AND f.status = 1
                     LIMIT 1
                     """,
-                    (uid, resp_id),
+                    (uid, canonical_resp_id),
                 )
                 existing = cur.fetchone()
                 if existing:
@@ -1082,7 +1095,7 @@ class ChatMySQLStore:
                         session_id,
                         turn_id,
                         turn_no,
-                        resp_id,
+                        canonical_resp_id,
                         summaries.get("question_summary"),
                         summaries.get("answer_summary"),
                         turn.get("fulfillment_status"),
