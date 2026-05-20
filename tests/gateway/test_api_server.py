@@ -1114,6 +1114,42 @@ class TestChatCompletionsEndpoint:
             assert data["choices"][0]["message"]["content"] == "Hello! How can I help you today?"
             assert data["choices"][0]["finish_reason"] == "stop"
             assert "usage" in data
+            assert "conversation" not in data
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_do_not_run_fulfillment_judge(self, adapter):
+        """Chat completions should not block on the deprecated fulfillment judge."""
+        mock_result = {
+            "final_response": "Hello! How can I help you today?",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                with patch.object(adapter, "_judge_fulfillment", new_callable=AsyncMock) as mock_judge:
+                    mock_run.return_value = (
+                        mock_result,
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    )
+                    mock_judge.return_value = {
+                        "fulfillment_status": "satisfied",
+                        "fulfillment_reason": "legacy",
+                        "is_final": True,
+                    }
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "hermes-agent",
+                            "messages": [{"role": "user", "content": "Hello"}],
+                        },
+                    )
+                    data = await resp.json()
+
+        assert resp.status == 200
+        assert "conversation" not in data
+        mock_judge.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_system_prompt_extracted(self, adapter):
@@ -1341,6 +1377,35 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+            assert "conversation" not in data
+
+    @pytest.mark.asyncio
+    async def test_responses_do_not_run_fulfillment_judge(self, adapter):
+        """Responses should not block on the deprecated fulfillment judge."""
+        mock_result = {"final_response": "Hello.", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                with patch.object(adapter, "_judge_fulfillment", new_callable=AsyncMock) as mock_judge:
+                    mock_run.return_value = (
+                        mock_result,
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    )
+                    mock_judge.return_value = {
+                        "fulfillment_status": "satisfied",
+                        "fulfillment_reason": "legacy",
+                        "is_final": True,
+                    }
+                    resp = await cli.post(
+                        "/v1/responses",
+                        json={"model": "hermes-agent", "input": "hello"},
+                    )
+                    data = await resp.json()
+
+        assert resp.status == 200
+        assert "conversation" not in data
+        mock_judge.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_successful_response_with_array_input(self, adapter):

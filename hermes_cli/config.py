@@ -944,9 +944,10 @@ DEFAULT_CONFIG = {
         "user": "root",
         "password": "",
         "database": "hermes_agent",
-        # After each API chat turn, auxiliary LLM judges intent fulfillment.
+        # Legacy switch for the old API chat fulfillment judge.
+        # New API turns no longer run this synchronous judge on the response path.
         "fulfillment_judge_enabled": True,
-        # When favoriting a satisfied turn, one LLM call summarizes Q&A for the list UI.
+        # When favoriting an eligible SQL turn, one LLM call summarizes Q&A for the list UI.
         "favorite_summarizer_enabled": True,
         # Turns of session history (including bookmarked turn) passed into the summarizer.
         "favorite_summarizer_history_turns": 5,

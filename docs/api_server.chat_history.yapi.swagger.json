@@ -168,8 +168,8 @@
     "/api/chat/favorites": {
       "post": {
         "tags": ["chat_history"],
-        "summary": "Favorite SQL from a satisfied turn",
-        "description": "Bookmarks all chat_sql_execution rows for the turn identified by hermes_response_id. Only fulfillment_status=satisfied is allowed. Stores AI-generated question_summary and answer_summary (not full text). Idempotent per user+response.",
+        "summary": "Favorite SQL from an eligible SQL turn",
+        "description": "Bookmarks all chat_sql_execution rows for the turn identified by hermes_response_id. A turn is eligible only when it has SQL executions and every SQL execution is successful with query_time_ms present and <= 5000. Stores AI-generated question_summary and answer_summary (not full text). Idempotent per user+response.",
         "security": [{"BearerAuth": []}],
         "parameters": [
           {
@@ -354,7 +354,7 @@
     },
     "ChatConversationFulfillment": {
       "type": "object",
-      "description": "LLM judge result for whether the turn satisfied user intent",
+      "description": "Legacy fulfillment fields on historical turns. New API responses no longer run the fulfillment judge.",
       "properties": {
         "fulfillment_status": {
           "type": "string",

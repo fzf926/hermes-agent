@@ -42,6 +42,7 @@ DEFAULT_HISTORY_SESSION_CONVERSATION_TYPES = (
     CONVERSATION_TYPE_HISTORY,
     CONVERSATION_TYPE_DIRECT,
 )
+SQL_FAVORITE_MAX_QUERY_TIME_MS = 5000.0
 
 
 class ConversationTypeMismatchError(ValueError):
@@ -78,6 +79,35 @@ def parse_conversation_types_filter(raw: Optional[str]) -> List[int]:
         except ValueError:
             continue
     return out or list(DEFAULT_HISTORY_SESSION_CONVERSATION_TYPES)
+
+
+def validate_sql_favorite_eligibility(sql_rows: List[Dict[str, Any]]) -> Optional[str]:
+    """Return an error string when a turn's SQL executions cannot be favorited."""
+    if not sql_rows:
+        return "No SQL executions found for this turn"
+
+    for idx, row in enumerate(sql_rows, 1):
+        status = str(row.get("status") or "").strip().lower()
+        if status != "success":
+            return (
+                "Only successful SQL executions can be favorited "
+                f"(SQL #{idx} status: {status or 'unknown'})"
+            )
+
+        raw_query_time = row.get("query_time_ms")
+        if raw_query_time is None:
+            return f"SQL #{idx} is missing query_time_ms and cannot be favorited"
+        try:
+            query_time_ms = float(raw_query_time)
+        except (TypeError, ValueError):
+            return f"SQL #{idx} has invalid query_time_ms and cannot be favorited"
+        if query_time_ms > SQL_FAVORITE_MAX_QUERY_TIME_MS:
+            return (
+                "Only SQL executions within 5 seconds can be favorited "
+                f"(SQL #{idx}: {query_time_ms:.3f}ms)"
+            )
+
+    return None
 
 
 try:
@@ -979,17 +1009,6 @@ class ChatMySQLStore:
                         "error": "Turn does not belong to this user",
                     }
 
-                fulfillment = (turn.get("fulfillment_status") or "").strip().lower()
-                if fulfillment != "satisfied":
-                    return {
-                        "ok": False,
-                        "http_status": 400,
-                        "error": (
-                            "Only turns with fulfillment_status=satisfied can be favorited "
-                            f"(current: {fulfillment or 'unknown'})"
-                        ),
-                    }
-
                 turn_id = int(turn["id"])
 
                 cur.execute(
@@ -1016,7 +1035,7 @@ class ChatMySQLStore:
 
                 cur.execute(
                     """
-                    SELECT id
+                    SELECT id, status, query_time_ms
                     FROM chat_sql_execution
                     WHERE turn_id = %s
                     ORDER BY id ASC
@@ -1024,11 +1043,12 @@ class ChatMySQLStore:
                     (turn_id,),
                 )
                 sql_rows = list(cur.fetchall())
-                if not sql_rows:
+                eligibility_error = validate_sql_favorite_eligibility(sql_rows)
+                if eligibility_error:
                     return {
                         "ok": False,
                         "http_status": 400,
-                        "error": "No SQL executions found for this turn",
+                        "error": eligibility_error,
                     }
 
                 ctx = self.get_turn_context_for_favorite_summary(

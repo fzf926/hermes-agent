@@ -12,7 +12,7 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/chat/favorites` | 按 `hermes_response_id` 收藏（仅 `fulfillment_status=satisfied`） |
+| POST | `/api/chat/favorites` | 按 `hermes_response_id` 收藏（必须有 SQL，且每条 SQL 成功并在 5 秒内返回） |
 | GET | `/api/chat/users/{user_id}/favorites` | 用户收藏列表（分页） |
 | GET | `/api/chat/favorites/{favorite_id}/sql` | 某条收藏下的 SQL 详情 |
 

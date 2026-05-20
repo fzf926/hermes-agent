@@ -2,7 +2,7 @@
   "swagger": "2.0",
   "info": {
     "title": "Hermes SQL Favorites API",
-    "description": "SQL 收藏接口。收藏 satisfied 轮次的 chat_sql_execution；Q&A 仅存 AI 摘要。conversation_type=2 续聊后会更新 followup_hermes_session_id。来源: gateway/platforms/api_server.py + gateway/chat_mysql_store.py",
+    "description": "SQL 收藏接口。收藏符合条件的 chat_sql_execution：必须有 SQL，且每条 SQL 成功并在 5 秒内返回（query_time_ms <= 5000）。Q&A 仅存 AI 摘要。conversation_type=2 续聊后会更新 followup_hermes_session_id。来源: gateway/platforms/api_server.py + gateway/chat_mysql_store.py",
     "version": "1.0.0"
   },
   "host": "127.0.0.1:8642",
@@ -28,8 +28,8 @@
     "/api/chat/favorites": {
       "post": {
         "tags": ["sql_favorites"],
-        "summary": "收藏一轮 satisfied 的 SQL",
-        "description": "根据 hermes_response_id 定位 chat_message → chat_turn → chat_sql_execution，写入收藏表。仅 fulfillment_status=satisfied 可收藏；同一 user_id + hermes_response_id 幂等（已存在返回 200）。创建时调用辅助 LLM 生成 question_summary / answer_summary，不存完整问答原文。",
+        "summary": "收藏一轮符合条件的 SQL",
+        "description": "根据 hermes_response_id 定位 chat_message → chat_turn → chat_sql_execution，写入收藏表。必须存在 SQL，且每条 SQL status=success、query_time_ms 非空并 <= 5000；同一 user_id + hermes_response_id 幂等（已存在返回 200）。创建时调用辅助 LLM 生成 question_summary / answer_summary，不存完整问答原文。",
         "security": [{"BearerAuth": []}],
         "parameters": [
           {

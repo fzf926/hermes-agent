@@ -2493,13 +2493,6 @@ class APIServerAdapter(BasePlatformAdapter):
         elif is_partial:
             turn_status = "interrupted"
         flow_step("post_agent", sql_count=len(sql_records), tool_count=len(tool_call_records))
-        fulfillment = await self._judge_fulfillment(
-            question_text=self._content_to_storage_text(user_message),
-            answer_text=final_response or None,
-            sql_executions=sql_records or None,
-            turn_status=turn_status,
-        )
-        self._attach_conversation(response_data, fulfillment)
 
         if user_id:
             await self._persist_chat_to_mysql(
@@ -2514,9 +2507,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 error_message=err_msg,
                 sql_executions=sql_records or None,
                 tool_calls=tool_call_records or None,
-                fulfillment_status=fulfillment.get("fulfillment_status"),
-                fulfillment_reason=fulfillment.get("fulfillment_reason"),
-                is_final=fulfillment.get("is_final"),
                 conversation_type=conversation_type,
                 favorite_id=favorite_id,
             )
@@ -2655,12 +2645,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     sql_count=len(sql_records),
                     tool_count=len(tool_call_records),
                 )
-                fulfillment = await self._judge_fulfillment(
-                    question_text=mysql_question_text,
-                    answer_text=final_text or None,
-                    sql_executions=sql_records or None,
-                    turn_status=turn_status,
-                )
                 effective_sid = (
                     (agent_result or {}).get("session_id") or session_id or ""
                 )
@@ -2677,9 +2661,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         error_message=err_msg,
                         sql_executions=sql_records or None,
                         tool_calls=tool_call_records or None,
-                        fulfillment_status=fulfillment.get("fulfillment_status"),
-                        fulfillment_reason=fulfillment.get("fulfillment_reason"),
-                        is_final=fulfillment.get("is_final"),
                         conversation_type=mysql_conversation_type,
                         favorite_id=mysql_favorite_id,
                     )
@@ -2696,8 +2677,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
             }
             self._attach_sql_results(finish_chunk, sql_records)
-            if fulfillment:
-                self._attach_conversation(finish_chunk, fulfillment)
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
@@ -3242,16 +3221,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ],
             })
 
-            stream_fulfillment: Dict[str, Any] = {}
             stream_turn_status = "error" if agent_error else "answered"
             if mysql_question_text:
                 flow_step("build_response_stream", response_id=response_id)
-                stream_fulfillment = await self._judge_fulfillment(
-                    question_text=mysql_question_text,
-                    answer_text=final_response_text or None,
-                    sql_executions=sql_records or None,
-                    turn_status=stream_turn_status,
-                )
 
             if agent_error:
                 failed_env = _envelope("failed")
@@ -3262,8 +3234,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
-                if stream_fulfillment:
-                    self._attach_conversation(failed_env, stream_fulfillment)
                 _failed_history = list(conversation_history)
                 _failed_history.append({"role": "user", "content": user_message})
                 if final_response_text or agent_error:
@@ -3289,8 +3259,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 }
                 self._attach_sql_results(completed_env, sql_records)
-                if stream_fulfillment:
-                    self._attach_conversation(completed_env, stream_fulfillment)
                 full_history = self._build_response_conversation_history(
                     conversation_history,
                     user_message,
@@ -3327,9 +3295,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     error_message=agent_error,
                     sql_executions=sql_records or None,
                     tool_calls=tool_call_records or None,
-                    fulfillment_status=stream_fulfillment.get("fulfillment_status"),
-                    fulfillment_reason=stream_fulfillment.get("fulfillment_reason"),
-                    is_final=stream_fulfillment.get("is_final"),
                     conversation_type=mysql_conversation_type,
                     favorite_id=mysql_favorite_id,
                 )
@@ -3823,13 +3788,6 @@ class APIServerAdapter(BasePlatformAdapter):
         resp_turn_status = "answered"
         if result.get("error"):
             resp_turn_status = "error"
-        fulfillment = await self._judge_fulfillment(
-            question_text=self._content_to_storage_text(user_message),
-            answer_text=final_response or None,
-            sql_executions=sql_records or None,
-            turn_status=resp_turn_status,
-        )
-        self._attach_conversation(response_data, fulfillment)
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -3865,9 +3823,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 error_message=result.get("error"),
                 sql_executions=sql_records or None,
                 tool_calls=tool_call_records or None,
-                fulfillment_status=fulfillment.get("fulfillment_status"),
-                fulfillment_reason=fulfillment.get("fulfillment_reason"),
-                is_final=fulfillment.get("is_final"),
                 conversation_type=conversation_type,
                 favorite_id=favorite_id,
             )
