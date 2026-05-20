@@ -254,6 +254,12 @@ def execute_with_volume_routing(
         meta["export_uid"] = export_uid
         meta["row_count"] = total
         meta["column_count"] = len(all_columns)
+        meta["query"] = {
+            "full_sql": resolved.sql_content,
+            "query_time": query_time_f,
+            "affected_rows": None,
+            "seconds_behind_master": None,
+        }
         meta["agent_instruction"] = (
             f"共 {total} 行，已生成本地 Excel。向用户提供 download_url，"
             "不要逐行列举或编造表格。"

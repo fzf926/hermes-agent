@@ -1,7 +1,10 @@
 import json
 
+from gateway.sql_execution import capture_dbops_sql_execution
 from tools import dbops_config, dbops_delivery, dbops_tool
+from tools.dbops_delivery_config import DBOpsDeliveryConfig
 from tools.dbops_http import DBOpsHttpResult
+from tools.dbops_models import DBOpsResolvedQuery
 
 
 def _meta_from_result(result: str) -> dict:
@@ -128,6 +131,59 @@ def test_dbops_env_enabled_inline_after_count(monkeypatch):
     assert meta["delivery_mode"] == "inline"
     assert meta["total_row_count"] == 1
     assert meta["generation_reason"] == "COUNT 后 inline"
+
+
+def test_dbops_excel_delivery_preserves_query_time_for_favorite(monkeypatch, tmp_path):
+    call = {"n": 0}
+
+    def fake_post(_url, payload, **_kwargs):
+        call["n"] += 1
+        if call["n"] == 1:
+            return DBOpsHttpResult(ok=True, columns=["cnt"], rows=[[25]])
+        return DBOpsHttpResult(
+            ok=True,
+            columns=["id"],
+            rows=[[1]],
+            data={
+                "column_list": ["id"],
+                "rows": [[1]],
+                "full_sql": payload.get("sql_content"),
+                "query_time": 0.123,
+            },
+        )
+
+    monkeypatch.setattr(dbops_delivery, "post_dbops_form", fake_post)
+    monkeypatch.setattr(dbops_delivery, "write_query_excel", lambda *_a, **_k: None)
+
+    outcome = dbops_delivery.execute_with_volume_routing(
+        DBOpsResolvedQuery(
+            sql_content="select id from tbl_term",
+            db_key="prod",
+            instance_name="online-instance",
+            db_name="codecamp",
+            schema_name="",
+            tb_name="",
+            limit_num=100,
+        ),
+        cookie_text="csrftoken=test",
+        csrf_token="test",
+        delivery_cfg=DBOpsDeliveryConfig(
+            excel_threshold_min=21,
+            excel_threshold_max=5000,
+            export_threshold=5001,
+            pagination_page_size=100,
+            exports_dir=tmp_path,
+        ),
+    )
+
+    record = capture_dbops_sql_execution(
+        "call_excel",
+        "dbops_query",
+        {"sql_content": "select id from tbl_term"},
+        outcome.text,
+    )
+
+    assert record["query_time_ms"] == 123.0
 
 
 def test_dbops_yaml_enabled_allows_execution_when_env_unset(monkeypatch):
