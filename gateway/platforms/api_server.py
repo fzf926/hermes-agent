@@ -1510,11 +1510,11 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
     async def _handle_download_sql_export(self, request: "web.Request") -> "web.Response":
-        """GET /api/chat/sql-exports/{export_uid}/download — download Hermes Excel export."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
+        """GET /api/chat/sql-exports/{export_uid}/download — download Hermes Excel export.
 
+        No Bearer auth: export_uid is an unguessable capability token (shared link /
+        browser download). Optional ?user_id= scopes MySQL lookup when enabled.
+        """
         export_uid = str(request.match_info.get("export_uid", "")).strip()
         if not export_uid or not export_uid.isalnum():
             return web.json_response(_openai_error("Invalid export_uid"), status=400)

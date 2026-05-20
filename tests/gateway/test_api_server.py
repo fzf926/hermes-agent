@@ -354,6 +354,33 @@ class TestAuth:
         assert result.status == 401
 
 
+class TestSqlExportDownload:
+    @pytest.mark.asyncio
+    async def test_download_does_not_require_api_key(self, auth_adapter, tmp_path, monkeypatch):
+        """Excel download links are capability URLs; browsers must not send Bearer."""
+        export_uid = "0c5f9d5979fa4cda91ad845580ee17cc"
+        xlsx = tmp_path / f"{export_uid}.xlsx"
+        xlsx.write_bytes(b"PK\x03\x04")
+
+        def _resolve(uid: str):
+            return xlsx if uid == export_uid else None
+
+        monkeypatch.setattr(
+            "gateway.sql_export_service.resolve_export_file_path",
+            _resolve,
+        )
+
+        app = web.Application()
+        app.router.add_get(
+            "/api/chat/sql-exports/{export_uid}/download",
+            auth_adapter._handle_download_sql_export,
+        )
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(f"/api/chat/sql-exports/{export_uid}/download")
+            assert resp.status == 200
+            assert await resp.read() == b"PK\x03\x04"
+
+
 # ---------------------------------------------------------------------------
 # Helpers for HTTP tests
 # ---------------------------------------------------------------------------
