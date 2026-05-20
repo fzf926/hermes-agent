@@ -887,14 +887,6 @@ DEFAULT_CONFIG = {
             "timeout": 45,
             "extra_body": {},
         },
-        "favorite_summarizer": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 30,
-            "extra_body": {},
-        },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
@@ -923,19 +915,6 @@ DEFAULT_CONFIG = {
         },
     },
     
-    # DBOps online query execution. Safe default: generate audited SQL only.
-    "dbops": {
-        "execute_enabled": False,
-        "excel_threshold_min": 21,
-        "excel_threshold_max": 5000,
-        "export_threshold": 5001,
-        "pagination_page_size": 1000,
-        "export_poll_interval_sec": 2.0,
-        "export_poll_timeout_sec": 180.0,
-        "exports_dir": "",
-        "public_base_url": "",
-    },
-
     # API server chat history persistence (MySQL). Env vars HERMES_MYSQL_* override.
     "mysql_chat": {
         "enabled": False,
@@ -944,13 +923,8 @@ DEFAULT_CONFIG = {
         "user": "root",
         "password": "",
         "database": "hermes_agent",
-        # Legacy switch for the old API chat fulfillment judge.
-        # New API turns no longer run this synchronous judge on the response path.
+        # After each API chat turn, auxiliary LLM judges intent fulfillment.
         "fulfillment_judge_enabled": True,
-        # When favoriting an eligible SQL turn, one LLM call summarizes Q&A for the list UI.
-        "favorite_summarizer_enabled": True,
-        # Turns of session history (including bookmarked turn) passed into the summarizer.
-        "favorite_summarizer_history_turns": 5,
     },
 
     "display": {

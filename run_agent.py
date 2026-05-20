@@ -1150,6 +1150,7 @@ class AIAgent:
         tool_progress_callback: callable = None,
         tool_start_callback: callable = None,
         tool_complete_callback: callable = None,
+        tool_call_policy_callback: callable = None,
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
@@ -1374,6 +1375,7 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.tool_start_callback = tool_start_callback
         self.tool_complete_callback = tool_complete_callback
+        self.tool_call_policy_callback = tool_call_policy_callback
         self.suppress_status_output = False
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
@@ -10823,13 +10825,26 @@ class AIAgent:
 
             block_result = None
             blocked_by_guardrail = False
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
+            if self.tool_call_policy_callback:
+                try:
+                    block_message = self.tool_call_policy_callback(
+                        tool_call.id,
+                        function_name,
+                        function_args,
+                    )
+                except Exception as cb_err:
+                    logging.debug(f"Tool policy callback error: {cb_err}")
+                    block_message = None
+            else:
                 block_message = None
+            if block_message is None:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    block_message = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    block_message = None
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -11201,13 +11216,23 @@ class AIAgent:
 
             # Check plugin hooks for a block directive before executing.
             _block_msg: Optional[str] = None
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                pass
+            if self.tool_call_policy_callback:
+                try:
+                    _block_msg = self.tool_call_policy_callback(
+                        tool_call.id,
+                        function_name,
+                        function_args,
+                    )
+                except Exception as cb_err:
+                    logging.debug(f"Tool policy callback error: {cb_err}")
+            if _block_msg is None:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    _block_msg = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    pass
 
             _guardrail_block_decision: ToolGuardrailDecision | None = None
             if _block_msg is None:

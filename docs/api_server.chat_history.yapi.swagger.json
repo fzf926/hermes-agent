@@ -2,7 +2,7 @@
   "swagger": "2.0",
   "info": {
     "title": "Hermes Chat History API",
-    "description": "MySQL 聊天记录与 SQL 收藏接口。来源: gateway/platforms/api_server.py + gateway/chat_mysql_store.py",
+    "description": "MySQL 聊天记录查询接口（独立 Swagger，仅含 2 个 GET 接口）。来源: gateway/platforms/api_server.py + gateway/chat_mysql_store.py",
     "version": "1.0.0"
   },
   "host": "127.0.0.1:8642",
@@ -21,7 +21,7 @@
   "tags": [
     {
       "name": "chat_history",
-      "description": "MySQL-backed chat session, turn, and SQL favorite queries"
+      "description": "MySQL-backed chat session and turn queries"
     }
   ],
   "paths": {
@@ -56,13 +56,6 @@
             "default": 1,
             "minimum": 1,
             "description": "Page number (1-based)"
-          },
-          {
-            "name": "conversation_type",
-            "in": "query",
-            "required": false,
-            "type": "string",
-            "description": "Filter by conversation type. Comma-separated: 1=history, 2=favorite, 3=direct SQL. Default 1,3 (normal history + direct SQL; excludes favorite sessions)."
           }
         ],
         "responses": {
@@ -76,7 +69,6 @@
                 "total": 1,
                 "limit": 20,
                 "page": 1,
-                "conversation_types": [1, 3],
                 "sessions": [
                   {
                     "id": 1,
@@ -84,7 +76,6 @@
                     "hermes_session_id": "sess_abc123",
                     "user_id": "10001",
                     "channel": "api_server",
-                    "conversation_type": 1,
                     "status": 1,
                     "turn_count": 3,
                     "last_question": "最近一条用户问题",
@@ -164,126 +155,6 @@
           }
         }
       }
-    },
-    "/api/chat/favorites": {
-      "post": {
-        "tags": ["chat_history"],
-        "summary": "Favorite SQL from an eligible SQL turn",
-        "description": "Bookmarks all chat_sql_execution rows for the turn identified by hermes_response_id. A turn is eligible only when it has SQL executions and every SQL execution is successful with query_time_ms present and <= 5000. Stores AI-generated question_summary and answer_summary (not full text). Idempotent per user+response.",
-        "security": [{"BearerAuth": []}],
-        "parameters": [
-          {
-            "name": "X-Hermes-User-Id",
-            "in": "header",
-            "required": false,
-            "type": "string",
-            "description": "Business user id (or pass body.user_id)"
-          },
-          {
-            "name": "body",
-            "in": "body",
-            "required": true,
-            "schema": {"$ref": "#/definitions/CreateSqlFavoriteRequest"}
-          }
-        ],
-        "responses": {
-          "201": {
-            "description": "Favorite created",
-            "schema": {"$ref": "#/definitions/CreateSqlFavoriteResponse"}
-          },
-          "200": {
-            "description": "Favorite already exists",
-            "schema": {"$ref": "#/definitions/CreateSqlFavoriteResponse"}
-          },
-          "400": {
-            "description": "Not satisfied or no SQL",
-            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
-          },
-          "403": {
-            "description": "Response belongs to another user",
-            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
-          },
-          "404": {
-            "description": "Message or turn not found",
-            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
-          }
-        }
-      }
-    },
-    "/api/chat/users/{user_id}/favorites": {
-      "get": {
-        "tags": ["chat_history"],
-        "summary": "List SQL favorites by user",
-        "security": [{"BearerAuth": []}],
-        "parameters": [
-          {
-            "name": "user_id",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "type": "integer",
-            "default": 20,
-            "minimum": 1,
-            "maximum": 100
-          },
-          {
-            "name": "page",
-            "in": "query",
-            "required": false,
-            "type": "integer",
-            "default": 1,
-            "minimum": 1
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Favorite list",
-            "schema": {"$ref": "#/definitions/ChatUserFavoritesResponse"}
-          }
-        }
-      }
-    },
-    "/api/chat/favorites/{favorite_id}/sql": {
-      "get": {
-        "tags": ["chat_history"],
-        "summary": "List SQL executions for a favorite",
-        "description": "favorite_id: internal id or favorite_uid",
-        "security": [{"BearerAuth": []}],
-        "parameters": [
-          {
-            "name": "favorite_id",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "X-Hermes-User-Id",
-            "in": "header",
-            "required": false,
-            "type": "string",
-            "description": "Optional ownership check"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "SQL list",
-            "schema": {"$ref": "#/definitions/ChatFavoriteSqlResponse"}
-          },
-          "403": {
-            "description": "Favorite belongs to another user",
-            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
-          },
-          "404": {
-            "description": "Favorite not found",
-            "schema": {"$ref": "#/definitions/OpenAIErrorEnvelope"}
-          }
-        }
-      }
     }
   },
   "definitions": {
@@ -308,10 +179,6 @@
         "user_id": {"type": "string"},
         "tenant_id": {"type": "string"},
         "channel": {"type": "string", "example": "api_server"},
-        "conversation_type": {
-          "type": "integer",
-          "description": "1=history, 2=favorite, 3=direct SQL"
-        },
         "title": {"type": "string"},
         "status": {"type": "integer", "description": "1=active, 2=closed, 3=archived"},
         "started_at": {"type": "string", "format": "date-time"},
@@ -345,16 +212,12 @@
           "type": "array",
           "items": {"$ref": "#/definitions/ChatSqlExecutionItem"}
         },
-        "sql_display": {
-          "type": "string",
-          "description": "Merged markdown for all SQL executions on this turn (same as /v1/responses)"
-        },
         "conversation": {"$ref": "#/definitions/ChatConversationFulfillment"}
       }
     },
     "ChatConversationFulfillment": {
       "type": "object",
-      "description": "Legacy fulfillment fields on historical turns. New API responses no longer run the fulfillment judge.",
+      "description": "LLM judge result for whether the turn satisfied user intent",
       "properties": {
         "fulfillment_status": {
           "type": "string",
@@ -376,15 +239,6 @@
         "error_message": {"type": "string"},
         "query_time_ms": {"type": "number"},
         "row_count": {"type": "integer"},
-        "total_row_count": {"type": "integer"},
-        "delivery_mode": {
-          "type": "string",
-          "enum": ["inline", "excel", "dbops_export", "sql_only"]
-        },
-        "download_url": {"type": "string"},
-        "generation_reason": {"type": "string"},
-        "export_uid": {"type": "string"},
-        "dbops_export_task_id": {"type": "string"},
         "result_table": {
           "type": "string",
           "description": "Markdown table: column headers + all rows merged"
@@ -403,11 +257,6 @@
         "total": {"type": "integer"},
         "limit": {"type": "integer"},
         "page": {"type": "integer", "minimum": 1, "example": 1},
-        "conversation_types": {
-          "type": "array",
-          "items": {"type": "integer"},
-          "description": "Applied filter (echo of query conversation_type)"
-        },
         "sessions": {
           "type": "array",
           "items": {"$ref": "#/definitions/ChatSessionSummary"}
@@ -423,81 +272,6 @@
         "turns": {
           "type": "array",
           "items": {"$ref": "#/definitions/ChatTurnItem"}
-        }
-      }
-    },
-    "CreateSqlFavoriteRequest": {
-      "type": "object",
-      "required": ["hermes_response_id"],
-      "properties": {
-        "hermes_response_id": {
-          "type": "string",
-          "description": "Assistant response id from /v1/responses"
-        },
-        "user_id": {
-          "type": "string",
-          "description": "Optional if X-Hermes-User-Id header is set"
-        }
-      }
-    },
-    "ChatSqlFavoriteSummary": {
-      "type": "object",
-      "properties": {
-        "id": {"type": "integer", "format": "int64"},
-        "favorite_uid": {"type": "string"},
-        "user_id": {"type": "string"},
-        "session_id": {"type": "integer", "format": "int64"},
-        "session_uid": {"type": "string"},
-        "hermes_session_id": {"type": "string"},
-        "turn_id": {"type": "integer", "format": "int64"},
-        "turn_no": {"type": "integer"},
-        "hermes_response_id": {"type": "string"},
-        "question_summary": {
-          "type": "string",
-          "description": "AI-generated short summary of the user question"
-        },
-        "answer_summary": {
-          "type": "string",
-          "description": "AI-generated short summary of the assistant answer"
-        },
-        "fulfillment_status": {"type": "string"},
-        "fulfillment_reason": {"type": "string"},
-        "sql_count": {"type": "integer"},
-        "created_at": {"type": "string", "format": "date-time"},
-        "updated_at": {"type": "string", "format": "date-time"}
-      }
-    },
-    "CreateSqlFavoriteResponse": {
-      "type": "object",
-      "properties": {
-        "object": {"type": "string", "example": "chat.sql_favorite"},
-        "created": {"type": "boolean"},
-        "favorite": {"$ref": "#/definitions/ChatSqlFavoriteSummary"}
-      }
-    },
-    "ChatUserFavoritesResponse": {
-      "type": "object",
-      "properties": {
-        "object": {"type": "string", "example": "list"},
-        "user_id": {"type": "string"},
-        "total": {"type": "integer"},
-        "limit": {"type": "integer"},
-        "page": {"type": "integer"},
-        "favorites": {
-          "type": "array",
-          "items": {"$ref": "#/definitions/ChatSqlFavoriteSummary"}
-        }
-      }
-    },
-    "ChatFavoriteSqlResponse": {
-      "type": "object",
-      "properties": {
-        "object": {"type": "string", "example": "list"},
-        "favorite": {"$ref": "#/definitions/ChatSqlFavoriteSummary"},
-        "total": {"type": "integer"},
-        "sql": {
-          "type": "array",
-          "items": {"$ref": "#/definitions/ChatSqlExecutionItem"}
         }
       }
     }

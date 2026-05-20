@@ -403,6 +403,31 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+    def test_direct_sql_dbops_guard_blocks_second_call(self, adapter):
+        guard = adapter._build_dbops_retry_guard(conversation_type=3)
+
+        assert guard("call_1", "dbops_query", {"sql_content": "select 1"}) is None
+        blocked = guard("call_2", "dbops_query", {"sql_content": "select 1"})
+
+        assert "direct SQL" in blocked
+        assert "already executed" in blocked
+
+    def test_history_dbops_guard_allows_one_retry(self, adapter):
+        guard = adapter._build_dbops_retry_guard(conversation_type=1)
+
+        assert guard("call_1", "dbops_query", {"sql_content": "select 1"}) is None
+        assert guard("call_2", "dbops_query", {"sql_content": "select 1"}) is None
+        blocked = guard("call_3", "dbops_query", {"sql_content": "select 1"})
+
+        assert "one retry" in blocked
+        assert "already executed" in blocked
+
+    def test_dbops_guard_ignores_other_tools(self, adapter):
+        guard = adapter._build_dbops_retry_guard(conversation_type=3)
+
+        assert guard("call_1", "session_search", {"query": "sql"}) is None
+        assert guard("call_2", "dbops_query", {"sql_content": "select 1"}) is None
+
     @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()

@@ -1,4 +1,4 @@
-"""Auto-generate short session titles from the first user/assistant exchange.
+"""Auto-generate short session titles from the first user turn.
 
 Runs asynchronously after the first response is delivered so it never
 adds latency to the user-facing reply.
@@ -20,20 +20,20 @@ FailureCallback = Callable[[str, BaseException], None]
 TitleCallback = Callable[[str], None]
 
 _TITLE_PROMPT = (
-    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
-    "following exchange. The title should capture the main topic or intent. "
+    "Generate a short, descriptive title (3-7 words) for a conversation based on the user's first message. "
+    "The title should capture the user's main topic or intent. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
 
 
 def generate_title(
     user_message: str,
-    assistant_response: str,
+    assistant_response: str = "",
     timeout: float = 30.0,
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
 ) -> Optional[str]:
-    """Generate a session title from the first exchange.
+    """Generate a session title from the first user message.
 
     Uses the main runtime's model when available, falling back to the
     auxiliary LLM client (cheapest/fastest available model).
@@ -46,11 +46,9 @@ def generate_title(
     """
     # Truncate long messages to keep the request small
     user_snippet = user_message[:500] if user_message else ""
-    assistant_snippet = assistant_response[:500] if assistant_response else ""
-
     messages = [
         {"role": "system", "content": _TITLE_PROMPT},
-        {"role": "user", "content": f"User: {user_snippet}\n\nAssistant: {assistant_snippet}"},
+        {"role": "user", "content": f"User first message: {user_snippet}"},
     ]
 
     try:
@@ -146,7 +144,7 @@ def maybe_auto_title(
     - This appears to be the first user→assistant exchange
     - No title is already set
     """
-    if not session_db or not session_id or not user_message or not assistant_response:
+    if not session_db or not session_id or not user_message:
         return
 
     # Count user messages in history to detect first exchange.
