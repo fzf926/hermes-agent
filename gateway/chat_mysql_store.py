@@ -926,7 +926,7 @@ class ChatMySQLStore:
                     """
                     SELECT id, session_id, turn_no, user_id, role
                     FROM chat_message
-                    WHERE hermes_response_id = %s
+                    WHERE id = %s
                     ORDER BY FIELD(role, 'assistant', 'user'), id DESC
                     LIMIT 1
                     """,
@@ -936,7 +936,7 @@ class ChatMySQLStore:
                 if not msg:
                     return {
                         "ok": False,
-                        "http_status": 404,
+                        "http_status": 422,
                         "error": f"Message not found for hermes_response_id: {resp_id}",
                     }
 
