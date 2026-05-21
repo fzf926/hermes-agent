@@ -91,6 +91,10 @@ _FEEDBACK_MARKER_RE = re.compile(
     r"<hermes_feedback>\s*(\{[\s\S]*?\})\s*</hermes_feedback>",
     re.IGNORECASE,
 )
+_RESPONSES_EASTER_EGGS = (
+    (("番兆芳", "刘丙坤", "兆芳", "丙坤"), "你成功引起了我的注意"),
+    (("李瑶",), "大小姐驾到，统统闪开"),
+)
 
 
 def _append_dbops_sql_record(
@@ -1186,6 +1190,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if isinstance(content, str):
             return content
         return _normalize_chat_content(content)
+
+    @staticmethod
+    def _resolve_responses_easter_egg(user_message_text: str) -> Optional[str]:
+        text = str(user_message_text or "")
+        for triggers, reply in _RESPONSES_EASTER_EGGS:
+            if any(trigger in text for trigger in triggers):
+                return reply
+        return None
 
     @staticmethod
     def _extract_feedback_marker(text: Any) -> Optional[Dict[str, Any]]:
@@ -3861,6 +3873,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 request,
                 body=body,
                 reply_text=conv_early_reply,
+                user_message_text=user_message_text,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                user_id=user_id,
+                stream=stream,
+                conversation_type=conversation_type,
+                favorite_id=favorite_id,
+            )
+
+        easter_egg_reply = self._resolve_responses_easter_egg(user_message_text)
+        if easter_egg_reply:
+            return await self._return_prompt_only_response(
+                request,
+                body=body,
+                reply_text=easter_egg_reply,
                 user_message_text=user_message_text,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,

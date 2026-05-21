@@ -2747,6 +2747,44 @@ class TestResponsesFeedbackCapture:
         )
 
 
+class TestResponsesEasterEgg:
+    @pytest.mark.asyncio
+    async def test_non_stream_easter_egg_uses_contains_match(self, adapter):
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "帮我查一下刘丙坤相关数据"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["output"][-1]["content"][0]["text"] == "你成功引起了我的注意"
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_easter_egg_for_liyao(self, adapter):
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "李瑶今天要看日报",
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert "大小姐驾到，统统闪开" in body
+        mock_run.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Usage / token counting
 # ---------------------------------------------------------------------------
