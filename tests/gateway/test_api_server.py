@@ -2645,6 +2645,109 @@ class TestToolCallsInOutput:
 
 
 # ---------------------------------------------------------------------------
+# Feedback capture
+# ---------------------------------------------------------------------------
+
+
+class TestResponsesFeedbackCapture:
+    @pytest.mark.asyncio
+    async def test_non_stream_response_records_feedback_marker(self, auth_adapter):
+        store = MagicMock()
+        store.save_qa_turn.return_value = {"session_id": 1, "turn_id": 2}
+        store.save_answer_feedback.return_value = {"ok": True, "feedback_id": 12}
+        marker = (
+            '<hermes_feedback>{"is_feedback":true,'
+            '"feedback_content":"上一轮统计口径不准确"}</hermes_feedback>'
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(auth_adapter, "_get_chat_mysql_store", return_value=store),
+                patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                mock_run.return_value = (
+                    {"final_response": marker, "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-User-Id": "user-1",
+                        "X-Hermes-Session-Key": "session-1",
+                    },
+                    json={
+                        "model": "hermes-agent",
+                        "input": "你刚才回答不准确，统计口径应该排除测试账号",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["output"][-1]["content"][0]["text"] == "反馈已记录，感谢你的补充。"
+        store.save_answer_feedback.assert_called_once_with(
+            user_id="user-1",
+            hermes_session_id="session-1",
+            feedback_content="上一轮统计口径不准确",
+            raw_user_message="你刚才回答不准确，统计口径应该排除测试账号",
+            target_response_id=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_response_records_feedback_marker(self, auth_adapter):
+        store = MagicMock()
+        store.save_qa_turn.return_value = {"session_id": 1, "turn_id": 2}
+        store.save_answer_feedback.return_value = {"ok": True, "feedback_id": 13}
+        marker = (
+            '<hermes_feedback>{"is_feedback":true,'
+            '"feedback_content":"上一轮 SQL 使用了错误字段"}</hermes_feedback>'
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(auth_adapter, "_get_chat_mysql_store", return_value=store),
+                patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                async def _mock_run_agent(**kwargs):
+                    cb = kwargs.get("stream_delta_callback")
+                    if cb:
+                        cb(marker)
+                    return (
+                        {"final_response": marker, "messages": [], "api_calls": 1},
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    )
+
+                mock_run.side_effect = _mock_run_agent
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-User-Id": "user-1",
+                        "X-Hermes-Session-Key": "session-1",
+                    },
+                    json={
+                        "model": "hermes-agent",
+                        "input": "不对，刚刚的 SQL 字段错了",
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert "反馈已记录，感谢你的补充。" in body
+        assert "<hermes_feedback>" not in body
+        store.save_answer_feedback.assert_called_once_with(
+            user_id="user-1",
+            hermes_session_id="session-1",
+            feedback_content="上一轮 SQL 使用了错误字段",
+            raw_user_message="不对，刚刚的 SQL 字段错了",
+            target_response_id=None,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Usage / token counting
 # ---------------------------------------------------------------------------
 

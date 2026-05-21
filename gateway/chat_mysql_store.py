@@ -577,6 +577,129 @@ class ChatMySQLStore:
         finally:
             conn.close()
 
+    def save_answer_feedback(
+        self,
+        *,
+        user_id: str,
+        hermes_session_id: str,
+        feedback_content: str,
+        raw_user_message: str,
+        target_response_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist feedback that the previous assistant answer was inaccurate."""
+        uid = (user_id or "").strip()
+        sid = (hermes_session_id or "").strip()
+        content = (feedback_content or "").strip()
+        raw = (raw_user_message or "").strip()
+        target_ref = (target_response_id or "").strip() or None
+        if not uid or not sid or not content:
+            return {"ok": False, "error": "user_id, hermes_session_id and feedback_content are required"}
+
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS chat_answer_feedback (
+                        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                        feedback_uid VARCHAR(64) NOT NULL UNIQUE,
+                        user_id VARCHAR(64) NOT NULL,
+                        session_id BIGINT UNSIGNED NOT NULL,
+                        turn_id BIGINT UNSIGNED NOT NULL,
+                        target_response_id VARCHAR(128) NULL,
+                        feedback_content TEXT NOT NULL,
+                        raw_user_message TEXT NULL,
+                        created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                        KEY idx_feedback_user_created (user_id, created_at),
+                        KEY idx_feedback_turn (turn_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM chat_session
+                    WHERE hermes_session_id = %s AND user_id = %s
+                    LIMIT 1
+                    """,
+                    (sid, uid),
+                )
+                session = cur.fetchone()
+                if not session:
+                    conn.commit()
+                    return {"ok": False, "error": "Session not found"}
+
+                session_id = int(session["id"])
+                if target_ref:
+                    cur.execute(
+                        """
+                        SELECT ct.id, am.hermes_response_id
+                        FROM chat_turn ct
+                        LEFT JOIN chat_message am ON am.id = ct.answer_message_id
+                        WHERE ct.session_id = %s
+                          AND ct.user_id = %s
+                          AND am.hermes_response_id = %s
+                        ORDER BY ct.turn_no DESC, ct.id DESC
+                        LIMIT 1
+                        """,
+                        (session_id, uid, target_ref),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT ct.id, am.hermes_response_id
+                        FROM chat_turn ct
+                        LEFT JOIN chat_message am ON am.id = ct.answer_message_id
+                        WHERE ct.session_id = %s
+                          AND ct.user_id = %s
+                          AND ct.answer_text IS NOT NULL
+                          AND ct.answer_text <> ''
+                        ORDER BY ct.turn_no DESC, ct.id DESC
+                        LIMIT 1
+                        """,
+                        (session_id, uid),
+                    )
+                turn = cur.fetchone()
+                if not turn:
+                    conn.commit()
+                    return {"ok": False, "error": "Target answer turn not found"}
+
+                canonical_target = (
+                    target_ref or str(turn.get("hermes_response_id") or "").strip() or None
+                )
+                feedback_uid = uuid.uuid4().hex
+                cur.execute(
+                    """
+                    INSERT INTO chat_answer_feedback (
+                        feedback_uid, user_id, session_id, turn_id,
+                        target_response_id, feedback_content, raw_user_message
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        feedback_uid,
+                        uid,
+                        session_id,
+                        int(turn["id"]),
+                        canonical_target,
+                        content[:2000],
+                        raw[:4000] or None,
+                    ),
+                )
+                feedback_id = int(cur.lastrowid)
+            conn.commit()
+            return {
+                "ok": True,
+                "feedback_id": feedback_id,
+                "feedback_uid": feedback_uid,
+                "turn_id": int(turn["id"]),
+                "target_response_id": canonical_target,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def list_sessions_by_user_id(
         self,
         user_id: str,

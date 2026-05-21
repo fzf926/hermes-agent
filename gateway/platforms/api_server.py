@@ -85,6 +85,13 @@ from gateway.chat_mysql_store import (
 
 logger = logging.getLogger(__name__)
 
+FEEDBACK_ACK_TEXT = "反馈已记录，感谢你的补充。"
+FEEDBACK_MISSING_TARGET_TEXT = "暂时没有找到可关联的上一条回答，反馈未记录。"
+_FEEDBACK_MARKER_RE = re.compile(
+    r"<hermes_feedback>\s*(\{[\s\S]*?\})\s*</hermes_feedback>",
+    re.IGNORECASE,
+)
+
 
 def _append_dbops_sql_record(
     sql_records: List[Dict[str, Any]],
@@ -1179,6 +1186,63 @@ class APIServerAdapter(BasePlatformAdapter):
         if isinstance(content, str):
             return content
         return _normalize_chat_content(content)
+
+    @staticmethod
+    def _extract_feedback_marker(text: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(text, str):
+            return None
+        match = _FEEDBACK_MARKER_RE.search(text)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict) or payload.get("is_feedback") is not True:
+            return None
+        feedback_content = str(payload.get("feedback_content") or "").strip()
+        if not feedback_content:
+            return None
+        target_response_id = payload.get("target_response_id")
+        return {
+            "feedback_content": feedback_content[:2000],
+            "target_response_id": (
+                str(target_response_id).strip()[:128]
+                if target_response_id is not None and str(target_response_id).strip()
+                else None
+            ),
+        }
+
+    async def _record_answer_feedback_to_mysql(
+        self,
+        *,
+        user_id: Optional[str],
+        hermes_session_id: Optional[str],
+        feedback_content: str,
+        raw_user_message: str,
+        target_response_id: Optional[str] = None,
+    ) -> bool:
+        store = self._get_chat_mysql_store()
+        if not store or not user_id or not hermes_session_id:
+            return False
+
+        loop = asyncio.get_running_loop()
+
+        def _run():
+            return store.save_answer_feedback(
+                user_id=user_id,
+                hermes_session_id=hermes_session_id,
+                feedback_content=feedback_content,
+                raw_user_message=raw_user_message,
+                target_response_id=target_response_id,
+            )
+
+        try:
+            result = await loop.run_in_executor(None, _run)
+            return bool((result or {}).get("ok"))
+        except Exception as exc:
+            logger.warning("MySQL answer feedback persist failed: %s", exc, exc_info=True)
+            return False
 
     async def _persist_chat_to_mysql(
         self,
@@ -3255,16 +3319,49 @@ class APIServerAdapter(BasePlatformAdapter):
                     elif tag == "__progress_delta__":
                         await _emit_progress_delta(payload)
                 elif isinstance(it, str):
-                    # Batch text deltas — append to buffer, flush on timer
-                    _batch_buf.append(it)
-                    if _batch_timer is None:
-                        _batch_timer = asyncio.create_task(_batch_flush_after(0.05))
+                    await _queue_text_delta(it)
                 # Other types are silently dropped.
 
             # ── Batching state ──
             _batch_buf: List[str] = []
             _batch_timer: Optional[asyncio.Task] = None
             _batch_lock = asyncio.Lock()
+            _feedback_probe_buf = ""
+            _feedback_marker_buf: Optional[List[str]] = None
+            _feedback_probe_done = False
+
+            async def _queue_text_delta(text: str) -> None:
+                nonlocal _batch_timer, _feedback_probe_buf, _feedback_marker_buf, _feedback_probe_done
+                marker_start = "<hermes_feedback"
+
+                if _feedback_marker_buf is not None:
+                    _feedback_marker_buf.append(text)
+                    return
+
+                if not _feedback_probe_done:
+                    _feedback_probe_buf += text
+                    probe = _feedback_probe_buf.lstrip()
+                    if probe.startswith(marker_start):
+                        _feedback_marker_buf = [_feedback_probe_buf]
+                        _feedback_probe_buf = ""
+                        return
+                    if marker_start.startswith(probe) and len(probe) < len(marker_start):
+                        return
+                    text = _feedback_probe_buf
+                    _feedback_probe_buf = ""
+                    _feedback_probe_done = True
+
+                _batch_buf.append(text)
+                if _batch_timer is None:
+                    _batch_timer = asyncio.create_task(_batch_flush_after(0.05))
+
+            async def _flush_feedback_probe_if_needed() -> None:
+                nonlocal _feedback_probe_buf, _feedback_probe_done
+                if _feedback_probe_buf:
+                    pending = _feedback_probe_buf
+                    _feedback_probe_buf = ""
+                    _feedback_probe_done = True
+                    await _queue_text_delta(pending)
 
             async def _batch_flush_after(delay: float) -> None:
                 """Wait delay seconds, then flush accumulated text deltas."""
@@ -3314,6 +3411,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     if _batch_timer and not _batch_timer.done():
                         _batch_timer.cancel()
                         _batch_timer = None
+                    await _flush_feedback_probe_if_needed()
                     if _batch_buf:
                         await _flush_batch()
                     break
@@ -3322,6 +3420,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 last_activity = time.monotonic()
 
             # Flush any final batched text before processing result
+            await _flush_feedback_probe_if_needed()
             if _batch_buf:
                 await _flush_batch()
 
@@ -3334,6 +3433,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 # the full response at the end), emit a single fallback
                 # delta so Responses clients still receive a live text part.
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+                feedback_marker = self._extract_feedback_marker(agent_final)
+                if feedback_marker:
+                    feedback_recorded = await self._record_answer_feedback_to_mysql(
+                        user_id=mysql_user_id,
+                        hermes_session_id=session_id,
+                        feedback_content=feedback_marker["feedback_content"],
+                        raw_user_message=mysql_question_text or self._content_to_storage_text(user_message),
+                        target_response_id=feedback_marker.get("target_response_id"),
+                    )
+                    agent_final = FEEDBACK_ACK_TEXT if feedback_recorded else FEEDBACK_MISSING_TARGET_TEXT
+                    if isinstance(result, dict):
+                        result = dict(result)
+                        result["final_response"] = agent_final
                 if agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
@@ -3969,6 +4081,18 @@ class APIServerAdapter(BasePlatformAdapter):
         final_response = result.get("final_response", "")
         if not final_response:
             final_response = result.get("error", "(No response generated)")
+        feedback_marker = self._extract_feedback_marker(final_response)
+        if feedback_marker:
+            feedback_recorded = await self._record_answer_feedback_to_mysql(
+                user_id=user_id,
+                hermes_session_id=session_id,
+                feedback_content=feedback_marker["feedback_content"],
+                raw_user_message=user_message_text,
+                target_response_id=feedback_marker.get("target_response_id"),
+            )
+            final_response = FEEDBACK_ACK_TEXT if feedback_recorded else FEEDBACK_MISSING_TARGET_TEXT
+            result = dict(result)
+            result["final_response"] = final_response
 
         flow_step(
             "post_agent",
