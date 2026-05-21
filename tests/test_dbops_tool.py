@@ -80,6 +80,70 @@ def test_dbops_sql_only_includes_generation_reason(monkeypatch):
     assert reason in result
 
 
+def test_dbops_rejects_sql_that_misses_configured_leftmost_index(monkeypatch):
+    monkeypatch.delenv("HERMES_DBOPS_EXECUTE_ENABLED", raising=False)
+    monkeypatch.setattr(
+        dbops_tool,
+        "_pick_db_config",
+        lambda _db_key: {
+            "key": "prod",
+            "instance_name": "online-instance",
+            "db_name": "codecamp",
+            "schema_name": "",
+            "tb_name": "",
+            "limit_num": 100,
+            "table_indexes": {
+                "tbl_term": [
+                    {"name": "idx_id", "columns": ["id"]},
+                    {"name": "idx_course_status", "columns": ["course_id", "status"]},
+                ]
+            },
+        },
+    )
+
+    result = dbops_tool.dbops_query_tool(
+        {
+            "sql_content": "select id from tbl_term where status = 1",
+            "db_key": "prod",
+        }
+    )
+
+    payload = json.loads(result)
+    assert payload["success"] is False
+    assert payload["sql_index_audit"]["passed"] is False
+    assert "leftmost column" in payload["error"]
+
+
+def test_dbops_allows_sql_using_configured_leftmost_index(monkeypatch):
+    monkeypatch.delenv("HERMES_DBOPS_EXECUTE_ENABLED", raising=False)
+    monkeypatch.setattr(
+        dbops_tool,
+        "_pick_db_config",
+        lambda _db_key: {
+            "key": "prod",
+            "instance_name": "online-instance",
+            "db_name": "codecamp",
+            "schema_name": "",
+            "tb_name": "",
+            "limit_num": 100,
+            "table_indexes": {
+                "tbl_term": [{"name": "idx_course_status", "columns": ["course_id", "status"]}]
+            },
+        },
+    )
+
+    result = dbops_tool.dbops_query_tool(
+        {
+            "sql_content": "select id from tbl_term where course_id = 503 and status = 1",
+            "db_key": "prod",
+        }
+    )
+
+    meta = _meta_from_result(result)
+    assert meta["success"] is True
+    assert meta["executed"] is False
+
+
 def test_dbops_env_enabled_inline_after_count(monkeypatch):
     monkeypatch.setenv("HERMES_DBOPS_EXECUTE_ENABLED", "1")
     monkeypatch.setattr(

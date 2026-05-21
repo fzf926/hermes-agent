@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,16 @@ COOKIE_KEYS = (
     "cluouser_name",
     "admin-authorization",
     "internal_account_token",
+)
+
+_SQL_IDENTIFIER_RE = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$]*)"
+_SQL_TABLE_RE = re.compile(
+    rf"\b(?:from|join)\s+({_SQL_IDENTIFIER_RE}(?:\s*\.\s*{_SQL_IDENTIFIER_RE})?)",
+    re.IGNORECASE,
+)
+_INDEXED_OPERATOR_RE = re.compile(
+    rf"(?:^|[\s(])(?:\w+\.)?`?{{column}}`?\s*(?:=|in\b|between\b|>=|<=|>|<|like\b)",
+    re.IGNORECASE,
 )
 
 
@@ -159,10 +170,90 @@ def _load_dbops_db_configs() -> list[dict[str, Any]]:
                 "db_name": db_name,
                 "schema_name": str(item.get("schema_name", "")).strip(),
                 "tb_name": str(item.get("tb_name", "")).strip(),
+                "table_indexes": item.get("table_indexes") if isinstance(item.get("table_indexes"), dict) else {},
+                "indexes": item.get("indexes") if isinstance(item.get("indexes"), dict) else {},
                 "limit_num": _normalize_limit(item.get("limit_num", 100)),
             }
         )
     return valid
+
+
+def _clean_sql_identifier(identifier: str) -> str:
+    return re.sub(r"[`\s]", "", identifier or "").split(".")[-1].lower()
+
+
+def _extract_sql_tables(sql: str) -> set[str]:
+    return {
+        _clean_sql_identifier(match.group(1))
+        for match in _SQL_TABLE_RE.finditer(sql or "")
+        if _clean_sql_identifier(match.group(1))
+    }
+
+
+def _normalize_table_indexes(raw: Any) -> dict[str, list[list[str]]]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, list[list[str]]] = {}
+    for table, indexes in raw.items():
+        table_name = _clean_sql_identifier(str(table))
+        if not table_name:
+            continue
+        normalized_indexes: list[list[str]] = []
+        if isinstance(indexes, dict):
+            iterable = indexes.values()
+        elif isinstance(indexes, list):
+            iterable = indexes
+        else:
+            iterable = []
+        for item in iterable:
+            columns: list[Any]
+            if isinstance(item, dict):
+                columns = item.get("columns") or item.get("fields") or []
+            else:
+                columns = item
+            if isinstance(columns, str):
+                columns = [part.strip() for part in columns.split(",")]
+            if not isinstance(columns, list):
+                continue
+            cleaned = [_clean_sql_identifier(str(col)) for col in columns]
+            cleaned = [col for col in cleaned if col]
+            if cleaned:
+                normalized_indexes.append(cleaned)
+        if normalized_indexes:
+            normalized[table_name] = normalized_indexes
+    return normalized
+
+
+def _sql_references_index_column(sql: str, column: str) -> bool:
+    pattern = _INDEXED_OPERATOR_RE.pattern.format(column=re.escape(_clean_sql_identifier(column)))
+    return re.search(pattern, sql or "", flags=re.IGNORECASE) is not None
+
+
+def _check_sql_index_requirements(sql: str, table_indexes: dict[str, list[list[str]]]) -> list[str]:
+    tables = _extract_sql_tables(sql)
+    violations: list[str] = []
+    for table in sorted(tables):
+        indexes = table_indexes.get(table)
+        if not indexes:
+            continue
+        if any(_sql_references_index_column(sql, index_columns[0]) for index_columns in indexes if index_columns):
+            continue
+        formatted = ", ".join(f"({', '.join(cols)})" for cols in indexes)
+        violations.append(
+            f"SQL for table `{table}` must filter or join on the leftmost column of an available index: {formatted}"
+        )
+    return violations
+
+
+def _dbops_source(resolved: DBOpsResolvedQuery) -> dict[str, Any]:
+    return {
+        "db_key": resolved.db_key,
+        "instance_name": resolved.instance_name,
+        "db_name": resolved.db_name,
+        "schema_name": resolved.schema_name,
+        "tb_name": resolved.tb_name,
+        "limit_num": resolved.limit_num,
+    }
 
 
 def _pick_db_config(db_key: str | None) -> dict[str, Any] | None:
@@ -220,6 +311,15 @@ def _build_dbops_schema_overrides() -> dict[str, Any]:
     configs = _load_dbops_db_configs()
     home = display_hermes_home()
     config_path = f"{home}/config/dbops_db_config.json"
+    index_hint_lines: list[str] = []
+    for item in configs:
+        table_indexes = _normalize_table_indexes(item.get("table_indexes") or item.get("indexes"))
+        for table, indexes in sorted(table_indexes.items()):
+            formatted = ", ".join(f"({', '.join(cols)})" for cols in indexes)
+            index_hint_lines.append(f"{item['key']}.{table}: {formatted}")
+    index_hint = ""
+    if index_hint_lines:
+        index_hint = " Available table indexes: " + "; ".join(index_hint_lines) + "."
 
     db_key_prop = {
         "type": "string",
@@ -241,8 +341,13 @@ def _build_dbops_schema_overrides() -> dict[str, Any]:
             "audited SQL only and does not access the online database. "
             "When execution is enabled: ≤20 rows inline table; ≥21 rows local Excel download; "
             ">5000 rows DBOps async export. Pass generation_reason to explain SQL provenance. "
+            "Before generating sql_content, check the target table indexes from dbops_db_config.json. "
+            "The generated SQL must satisfy index requirements: every indexed table must use at least "
+            "one available index's leftmost column in WHERE or JOIN conditions. "
+            "If the user request lacks an indexed filter, ask a clarifying question instead of generating a full scan. "
             "On success, copy ``user_display`` verbatim to the user (one summary line + one table with "
             "all rows). Never list rows as 记录1/记录2 field-by-field. See ``agent_instruction``."
+            f"{index_hint}"
         ),
         "parameters": {
             "type": "object",
@@ -251,6 +356,8 @@ def _build_dbops_schema_overrides() -> dict[str, Any]:
                     "type": "string",
                     "description": (
                         "SQL to execute in DBOps (read-only). Only SELECT and EXPLAIN are allowed; "
+                        "must satisfy table index requirements by filtering/joining on an available "
+                        "index leftmost column; "
                         "e.g. select * from tbl_term where id = 17660"
                     ),
                 },
@@ -311,14 +418,7 @@ def _format_dbops_sql_only_result(
     *,
     generation_reason: str | None = None,
 ) -> str:
-    source = {
-        "db_key": resolved.db_key,
-        "instance_name": resolved.instance_name,
-        "db_name": resolved.db_name,
-        "schema_name": resolved.schema_name,
-        "tb_name": resolved.tb_name,
-        "limit_num": resolved.limit_num,
-    }
+    source = _dbops_source(resolved)
     reason_block = _format_generation_reason_block(generation_reason)
     message = (
         "已生成 SQL，DBOps 执行开关关闭，未执行查询，未访问线上库。\n\n"
@@ -357,6 +457,31 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
     if isinstance(resolved, str):
         return tool_error(resolved)
 
+    selected_cfg = _pick_db_config(query_input.db_key)
+    table_indexes = _normalize_table_indexes(
+        (selected_cfg or {}).get("table_indexes") or (selected_cfg or {}).get("indexes")
+    )
+    index_violations = _check_sql_index_requirements(resolved.sql_content, table_indexes)
+    if index_violations:
+        return tool_error(
+            "SQL index requirement failed: " + "; ".join(index_violations),
+            success=False,
+            sql_index_audit={
+                "passed": False,
+                "violations": index_violations,
+                "table_indexes": table_indexes,
+            },
+            source={
+                "db_key": resolved.db_key,
+                "instance_name": resolved.instance_name,
+                "db_name": resolved.db_name,
+                "schema_name": resolved.schema_name,
+                "tb_name": resolved.tb_name,
+                "limit_num": resolved.limit_num,
+            },
+            query={"full_sql": resolved.sql_content},
+        )
+
     user_id = str(args.get("user_id", "")).strip() or None
     audit = _sql_auditor.audit(
         resolved.sql_content,
@@ -372,11 +497,7 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
             f"SQL audit failed: {audit.message}",
             success=False,
             sql_audit=audit.to_dict(),
-            source={
-                "db_key": resolved.db_key,
-                "instance_name": resolved.instance_name,
-                "db_name": resolved.db_name,
-            },
+            source=_dbops_source(resolved),
             query={"full_sql": resolved.sql_content},
         )
 
@@ -389,14 +510,7 @@ def dbops_query_tool(args: dict[str, Any]) -> str:
     if not cookie_text:
         return tool_error("dbops cookie is empty in ~/.hermes/config/dbops_cookie.json")
 
-    _source = {
-        "db_key": resolved.db_key,
-        "instance_name": resolved.instance_name,
-        "db_name": resolved.db_name,
-        "schema_name": resolved.schema_name,
-        "tb_name": resolved.tb_name,
-        "limit_num": resolved.limit_num,
-    }
+    _source = _dbops_source(resolved)
     _query_meta = {"full_sql": resolved.sql_content}
 
     outcome = execute_with_volume_routing(
