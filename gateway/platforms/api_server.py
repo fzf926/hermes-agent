@@ -3011,6 +3011,39 @@ class APIServerAdapter(BasePlatformAdapter):
                     "logprobs": [],
                 })
 
+            async def _emit_progress_delta(payload: Dict[str, Any]) -> None:
+                """Emit a safe, user-visible progress update.
+
+                This intentionally excludes model chain-of-thought, tool
+                arguments, and tool results.  Clients can use it to show what
+                the agent is doing without exposing sensitive internals.
+                """
+                tool_name = str(payload.get("tool") or payload.get("name") or "").strip()
+                status = str(payload.get("status") or "running").strip() or "running"
+                if not tool_name or tool_name.startswith("_"):
+                    return
+                if status == "completed":
+                    message = f"Tool {tool_name} completed"
+                    step = "tool_completed"
+                else:
+                    message = f"Calling tool {tool_name}"
+                    step = "tool_started"
+                event: Dict[str, Any] = {
+                    "type": "response.progress.delta",
+                    "response_id": response_id,
+                    "step": step,
+                    "status": status,
+                    "message": message,
+                    "tool": tool_name,
+                }
+                call_id = payload.get("tool_call_id") or payload.get("call_id") or payload.get("toolCallId")
+                if call_id:
+                    event["call_id"] = call_id
+                latency_ms = payload.get("latency_ms")
+                if latency_ms is not None:
+                    event["latency_ms"] = latency_ms
+                await _write_event("response.progress.delta", event)
+
             async def _emit_tool_started(payload: Dict[str, Any]) -> str:
                 """Emit response.output_item.added for a function_call.
 
@@ -3137,6 +3170,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__progress_delta__":
+                        await _emit_progress_delta(payload)
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -3659,18 +3694,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put(delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Queue non-start tool progress events if needed in future.
+                """Ignore legacy progress callbacks to avoid duplicate events.
 
-                The structured Responses stream uses ``tool_start_callback``
-                and ``tool_complete_callback`` for exact call-id correlation,
-                so progress events are currently ignored here.
+                The safe Responses progress stream is driven by the structured
+                tool_start/tool_complete callbacks below, which carry exact
+                call-id correlation and avoid leaking args/results.
                 """
+                del event_type, name, preview, args, kwargs
                 return
 
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Queue a started tool for live function_call streaming."""
                 if tool_call_id and not function_name.startswith("_"):
                     tool_call_started_at[tool_call_id] = time.monotonic()
+                    _stream_q.put(("__progress_delta__", {
+                        "tool_call_id": tool_call_id,
+                        "tool": function_name,
+                        "status": "running",
+                    }))
                 _stream_q.put(("__tool_started__", {
                     "tool_call_id": tool_call_id,
                     "name": function_name,
@@ -3701,6 +3742,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool=function_name,
                     latency_ms=latency_ms or 0,
                 )
+                if tool_call_id and not function_name.startswith("_"):
+                    _stream_q.put(("__progress_delta__", {
+                        "tool_call_id": tool_call_id,
+                        "tool": function_name,
+                        "status": "completed",
+                        "latency_ms": latency_ms,
+                    }))
                 _stream_q.put(("__tool_completed__", {
                     "tool_call_id": tool_call_id,
                     "name": function_name,

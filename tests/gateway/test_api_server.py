@@ -2019,6 +2019,36 @@ class TestResponsesStreaming:
                 assert '"output": [{"type": "input_text", "text": "{\\"content\\":\\"hello\\"}"}]' in body
 
     @pytest.mark.asyncio
+    async def test_stream_emits_safe_progress_events_for_tool_lifecycle(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                start_cb = kwargs.get("tool_start_callback")
+                complete_cb = kwargs.get("tool_complete_callback")
+                if start_cb:
+                    start_cb("call_123", "read_file", {"path": "/tmp/secret.txt"})
+                if complete_cb:
+                    complete_cb("call_123", "read_file", {"path": "/tmp/secret.txt"}, "secret contents")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "read the file", "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert body.count("event: response.progress.delta") >= 2
+                assert '"status": "running"' in body
+                assert '"status": "completed"' in body
+                assert '"tool": "read_file"' in body
+                assert "Calling tool read_file" in body
+                assert "Tool read_file completed" in body
+
+    @pytest.mark.asyncio
     async def test_streamed_response_is_stored_for_get(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
