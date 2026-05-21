@@ -2795,6 +2795,43 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    @staticmethod
+    def _thinking_message_for_tool(tool_name: str, status: str) -> str:
+        tool_name = str(tool_name or "").strip()
+        progress_messages = {
+            "search_files": ("正在检索相关文件", "相关文件检索完成"),
+            "read_file": ("正在读取相关文件", "相关文件读取完成"),
+            "dbops_query": ("正在生成、校验并查询数据库", "数据库查询完成"),
+            "execute_code": ("正在运行计算步骤", "计算步骤完成"),
+        }
+        running_message, completed_message = progress_messages.get(
+            tool_name,
+            (f"正在调用工具 {tool_name}", f"工具 {tool_name} 调用完成"),
+        )
+        return completed_message if status == "completed" else running_message
+
+    @classmethod
+    def _thinking_messages_from_output_items(
+        cls,
+        output_items: List[Dict[str, Any]],
+    ) -> List[str]:
+        messages: List[str] = []
+        call_names: Dict[str, str] = {}
+        for item in output_items:
+            item_type = item.get("type")
+            if item_type == "function_call":
+                call_id = str(item.get("call_id") or "")
+                tool_name = str(item.get("name") or "")
+                if call_id:
+                    call_names[call_id] = tool_name
+                messages.append(cls._thinking_message_for_tool(tool_name, "running"))
+            elif item_type == "function_call_output":
+                call_id = str(item.get("call_id") or "")
+                tool_name = call_names.get(call_id, "")
+                if tool_name:
+                    messages.append(cls._thinking_message_for_tool(tool_name, "completed"))
+        return messages
+
     async def _write_sse_responses(
         self,
         request: "web.Request",
@@ -2869,6 +2906,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
+        thinking_messages: List[str] = []
         # Track open function_call items by name so we can emit a matching
         # ``done`` event when the tool completes.  Order preserved.
         pending_tool_calls: List[Dict[str, Any]] = []
@@ -2953,6 +2991,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             incomplete_env = _envelope("incomplete")
             incomplete_env["output"] = incomplete_items
+            if thinking_messages:
+                incomplete_env["thinking_msg"] = list(thinking_messages)
             incomplete_env["usage"] = {
                 "input_tokens": usage.get("input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
@@ -3059,22 +3099,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             details["language"] = language
                     return details
 
-                progress_messages = {
-                    "search_files": ("正在检索相关文件", "相关文件检索完成"),
-                    "read_file": ("正在读取相关文件", "相关文件读取完成"),
-                    "dbops_query": ("正在生成、校验并查询数据库", "数据库查询完成"),
-                    "execute_code": ("正在运行计算步骤", "计算步骤完成"),
-                }
-                running_message, completed_message = progress_messages.get(
-                    tool_name,
-                    (f"正在调用工具 {tool_name}", f"工具 {tool_name} 调用完成"),
-                )
                 if status == "completed":
-                    message = completed_message
                     step = "tool_completed"
                 else:
-                    message = running_message
                     step = "tool_started"
+                message = self._thinking_message_for_tool(tool_name, status)
+                thinking_messages.append(message)
                 event: Dict[str, Any] = {
                     "type": "response.progress.delta",
                     "response_id": response_id,
@@ -3082,6 +3112,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "phase": "tool_execution",
                     "status": status,
                     "message": message,
+                    "thinking_msg": message,
                     "tool": tool_name,
                 }
                 details = _safe_details()
@@ -3398,6 +3429,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 failed_env = _envelope("failed")
                 failed_env["output"] = final_items
                 failed_env["error"] = {"message": agent_error, "type": "server_error"}
+                if thinking_messages:
+                    failed_env["thinking_msg"] = list(thinking_messages)
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -3423,6 +3456,8 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 completed_env = _envelope("completed")
                 completed_env["output"] = final_items
+                if thinking_messages:
+                    completed_env["thinking_msg"] = list(thinking_messages)
                 completed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -3730,6 +3765,7 @@ class APIServerAdapter(BasePlatformAdapter):
         sql_records: List[Dict[str, Any]] = []
         tool_call_records: List[Dict[str, Any]] = []
         tool_call_started_at: Dict[str, float] = {}
+        thinking_messages: List[str] = []
 
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
@@ -3860,6 +3896,9 @@ class APIServerAdapter(BasePlatformAdapter):
         def _on_tool_start_responses(tool_call_id, function_name, function_args):
             if tool_call_id and not function_name.startswith("_"):
                 tool_call_started_at[tool_call_id] = time.monotonic()
+                thinking_messages.append(
+                    self._thinking_message_for_tool(function_name, "running")
+                )
 
         def _on_tool_complete_responses(
             tool_call_id, function_name, function_args, function_result
@@ -3886,6 +3925,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool=function_name,
                 latency_ms=latency_ms or 0,
             )
+            if tool_call_id and not function_name.startswith("_"):
+                thinking_messages.append(
+                    self._thinking_message_for_tool(function_name, "completed")
+                )
 
         flow_step("agent_run_start", mode="sync")
         async def _compute_response():
@@ -3960,6 +4003,8 @@ class APIServerAdapter(BasePlatformAdapter):
             result,
         )
         output_items = self._extract_output_items(result, start_index=output_start_index)
+        if not thinking_messages:
+            thinking_messages = self._thinking_messages_from_output_items(output_items)
 
         response_data = {
             "id": response_id,
@@ -3974,6 +4019,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        if thinking_messages:
+            response_data["thinking_msg"] = list(thinking_messages)
         self._attach_sql_results(response_data, sql_records)
 
         resp_turn_status = self._turn_status_from_agent_result(result)
