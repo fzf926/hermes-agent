@@ -58,6 +58,7 @@ from gateway.chat_flow_timing import (
     reset_chat_flow_timer,
 )
 from gateway.config import Platform, PlatformConfig
+from gateway.data_query_prompt import build_data_query_ephemeral_prompt
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -2894,7 +2895,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if "sequence_number" not in data:
                 data["sequence_number"] = sequence_number
             sequence_number += 1
-            payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+            payload = f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
             await response.write(payload.encode())
 
         def _envelope(status: str) -> Dict[str, Any]:
@@ -3022,20 +3023,70 @@ class APIServerAdapter(BasePlatformAdapter):
                 status = str(payload.get("status") or "running").strip() or "running"
                 if not tool_name or tool_name.startswith("_"):
                     return
+                def _short_text(value: Any, *, max_len: int = 300) -> str:
+                    text = re.sub(r"\s+", " ", str(value or "")).strip()
+                    if len(text) > max_len:
+                        return text[:max_len].rstrip() + "..."
+                    return text
+
+                def _safe_details() -> Dict[str, Any]:
+                    args = payload.get("arguments")
+                    if not isinstance(args, dict):
+                        return {}
+                    details: Dict[str, Any] = {}
+                    if tool_name == "read_file":
+                        target = _short_text(args.get("path"))
+                        if target:
+                            details["target"] = target
+                    elif tool_name == "search_files":
+                        query = _short_text(args.get("query") or args.get("pattern"))
+                        if query:
+                            details["query"] = query
+                        target = _short_text(args.get("path"))
+                        if target:
+                            details["target"] = target
+                    elif tool_name == "dbops_query":
+                        for key in ("db_key", "db_name", "tb_name"):
+                            value = _short_text(args.get(key), max_len=120)
+                            if value:
+                                details[key] = value
+                        sql_preview = _short_text(args.get("sql_content"))
+                        if sql_preview:
+                            details["sql_preview"] = sql_preview
+                    elif tool_name == "execute_code":
+                        language = _short_text(args.get("language"), max_len=80)
+                        if language:
+                            details["language"] = language
+                    return details
+
+                progress_messages = {
+                    "search_files": ("正在检索相关文件", "相关文件检索完成"),
+                    "read_file": ("正在读取相关文件", "相关文件读取完成"),
+                    "dbops_query": ("正在生成、校验并查询数据库", "数据库查询完成"),
+                    "execute_code": ("正在运行计算步骤", "计算步骤完成"),
+                }
+                running_message, completed_message = progress_messages.get(
+                    tool_name,
+                    (f"正在调用工具 {tool_name}", f"工具 {tool_name} 调用完成"),
+                )
                 if status == "completed":
-                    message = f"Tool {tool_name} completed"
+                    message = completed_message
                     step = "tool_completed"
                 else:
-                    message = f"Calling tool {tool_name}"
+                    message = running_message
                     step = "tool_started"
                 event: Dict[str, Any] = {
                     "type": "response.progress.delta",
                     "response_id": response_id,
                     "step": step,
+                    "phase": "tool_execution",
                     "status": status,
                     "message": message,
                     "tool": tool_name,
                 }
+                details = _safe_details()
+                if details:
+                    event["details"] = details
                 call_id = payload.get("tool_call_id") or payload.get("call_id") or payload.get("toolCallId")
                 if call_id:
                     event["call_id"] = call_id
@@ -3617,6 +3668,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         user_message_text = self._content_to_storage_text(user_message)
+        instructions = build_data_query_ephemeral_prompt(instructions)
 
         instructions, conv_err, conv_early_reply = self._resolve_conversation_mode(
             request,
@@ -3711,6 +3763,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "tool_call_id": tool_call_id,
                         "tool": function_name,
                         "status": "running",
+                        "arguments": function_args or {},
                     }))
                 _stream_q.put(("__tool_started__", {
                     "tool_call_id": tool_call_id,
@@ -3748,6 +3801,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "tool": function_name,
                         "status": "completed",
                         "latency_ms": latency_ms,
+                        "arguments": function_args or {},
                     }))
                 _stream_q.put(("__tool_completed__", {
                     "tool_call_id": tool_call_id,

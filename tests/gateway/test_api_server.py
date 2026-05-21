@@ -1536,7 +1536,7 @@ class TestResponsesEndpoint:
 
     @pytest.mark.asyncio
     async def test_instructions_as_ephemeral_prompt(self, adapter):
-        """The instructions field maps to ephemeral_system_prompt."""
+        """The instructions field is appended after the default data-query prompt."""
         mock_result = {"final_response": "Ahoy!", "messages": [], "api_calls": 1}
 
         app = _create_app(adapter)
@@ -1554,7 +1554,29 @@ class TestResponsesEndpoint:
 
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
-            assert call_kwargs["ephemeral_system_prompt"] == "Talk like a pirate."
+            prompt = call_kwargs["ephemeral_system_prompt"]
+            assert "运营/老师的数据查询助手" in prompt
+            assert "必须命中可用索引的最左列" in prompt
+            assert "Talk like a pirate." in prompt
+
+    @pytest.mark.asyncio
+    async def test_responses_inject_default_data_query_prompt_without_instructions(self, adapter):
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "查一下昨天报名人数"},
+                )
+
+            assert resp.status == 200
+            prompt = mock_run.call_args.kwargs["ephemeral_system_prompt"]
+            assert "运营/老师的数据查询助手" in prompt
+            assert "缺少时间范围、业务对象、统计口径或筛选条件时先追问" in prompt
+            assert "存在多个相似候选表时先让用户确认" in prompt
 
     @pytest.mark.asyncio
     async def test_previous_response_id_chaining(self, adapter):
@@ -2045,8 +2067,13 @@ class TestResponsesStreaming:
                 assert '"status": "running"' in body
                 assert '"status": "completed"' in body
                 assert '"tool": "read_file"' in body
-                assert "Calling tool read_file" in body
-                assert "Tool read_file completed" in body
+                assert "正在读取相关文件" in body
+                assert "相关文件读取完成" in body
+                assert '"thinking_msg": "正在读取相关文件"' in body
+                assert '"thinking_msg": "相关文件读取完成"' in body
+                assert '"phase": "tool_execution"' in body
+                assert '"target": "/tmp/secret.txt"' in body
+                assert '"latency_ms":' in body
 
     @pytest.mark.asyncio
     async def test_streamed_response_is_stored_for_get(self, adapter):
@@ -2592,6 +2619,10 @@ class TestToolCallsInOutput:
             assert output[1]["output"] == "42"
             assert output[2]["type"] == "message"
             assert output[2]["content"][0]["text"] == "The result is 42."
+            assert data["thinking_msg"] == [
+                "正在调用工具 calculator",
+                "工具 calculator 调用完成",
+            ]
 
     @pytest.mark.asyncio
     async def test_no_tool_calls_still_works(self, adapter):

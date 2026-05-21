@@ -144,6 +144,19 @@ def test_dbops_allows_sql_using_configured_leftmost_index(monkeypatch):
     assert meta["executed"] is False
 
 
+def test_dbops_dynamic_schema_includes_data_query_guidance(monkeypatch):
+    monkeypatch.setattr(dbops_tool, "_load_dbops_db_configs", lambda: [])
+
+    schema = dbops_tool._build_dbops_schema_overrides()
+    description = schema["description"]
+
+    assert "运营/老师问数" in description
+    assert "缺少时间范围、业务对象、统计口径或筛选条件时先追问" in description
+    assert "多个相似候选表" in description
+    assert "执行开关关闭" in description
+    assert "不要声称已经查询" in description
+
+
 def test_dbops_env_enabled_inline_after_count(monkeypatch):
     monkeypatch.setenv("HERMES_DBOPS_EXECUTE_ENABLED", "1")
     monkeypatch.setattr(
